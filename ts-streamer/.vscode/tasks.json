@@ -1,0 +1,44 @@
+{
+    // See https://go.microsoft.com/fwlink/?LinkId=733558
+    // for the documentation about the tasks.json format
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build (remote x86)",
+            "type": "shell",
+            "command": "scp -r -p ../../icyradio-apps icyradio-x86-0.lan:~ && ssh icyradio-x86-0.lan \"cd ~/icyradio-apps/ts-streamer && make clean && make\"",
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            }
+        },
+        {
+            "label": "Build (remote ARM)",
+            "type": "shell",
+            "command": "scp -r -p ../../icyradio-apps icyradio1.lan:~ && ssh icyradio1.lan \"cd ~/icyradio-apps/ts-streamer && make clean && make\"",
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            }
+        },
+        {
+            "label": "Build",
+            "type": "shell",
+            "command": "make",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        },
+        {
+            "label": "Rebuild",
+            "type": "shell",
+            "command": "make clean; make"
+        },
+        {
+            "label": "Clean",
+            "type": "shell",
+            "command": "make clean"
+        }
+    ]
+}

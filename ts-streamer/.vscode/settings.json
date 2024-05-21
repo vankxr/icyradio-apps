@@ -1,0 +1,22 @@
+{
+    "files.associations": {
+        "device.h": "c",
+        "liquid.h": "c",
+        "bit": "c",
+        "compare": "c",
+        "condition_variable": "c",
+        "cstddef": "c",
+        "forward_list": "c",
+        "list": "c",
+        "string": "c",
+        "optional": "c",
+        "limits": "c",
+        "memory": "c",
+        "mutex": "c",
+        "new": "c",
+        "functional": "c",
+        "stdint.h": "c",
+        "pthread.h": "c",
+        "unistd.h": "c"
+    }
+}
