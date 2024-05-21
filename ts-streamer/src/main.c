@@ -97,15 +97,16 @@ int main(int argc, char *argv[])
     double fCarrierFreq = 433e6;
     double fSampleRate = 2.4e6;
     size_t ulNumTSFramesPerPacket = 32;
+    size_t ulNumDetectorThreads = 4;
 
     int iOpt;
-    while((iOpt = getopt(argc, argv, "hdztrg:af:s:n:")) != EOF)
+    while((iOpt = getopt(argc, argv, "hdztrg:af:s:n:j:")) != EOF)
     {
         switch(iOpt)
         {
             case 'h':
             {
-                DBGPRINTLN("Usage: %s [-h] [-d] [-z] [-t] [-r] [-g <gain_dB>] [-a] [-f <freq>] [-s <rate>] [-n <num>]", argv[0]);
+                DBGPRINTLN("Usage: %s [-h] [-d] [-z] [-t] [-r] [-g <gain_dB>] [-a] [-f <freq>] [-s <rate>] [-n <num>] [-j <threads>]", argv[0]);
                 DBGPRINTLN("  -h: Print this help message");
                 DBGPRINTLN("  -d: Dummy mode (generate random TX data and discard RX data)");
                 DBGPRINTLN("  -z: No radio mode (RX outputs samples to stdout and TX reads samples from stdin)");
@@ -116,6 +117,7 @@ int main(int argc, char *argv[])
                 DBGPRINTLN("  -f <freq>: Carrier frequency (default: 433 MHz)");
                 DBGPRINTLN("  -s <rate>: Sample rate (default: 2.4 Msps)");
                 DBGPRINTLN("  -n <num>: Number of TS frames per packet (default: 32)");
+                DBGPRINTLN("  -j <threads>: Number of detector threads (RX only) (default: 4)");
 
                 return 0;
             }
@@ -165,6 +167,13 @@ int main(int argc, char *argv[])
                 int n = atoi(optarg);
 
                 ulNumTSFramesPerPacket = n <= 0 ? 32 : n;
+            }
+            break;
+            case 'j':
+            {
+                int n = atoi(optarg);
+
+                ulNumDetectorThreads = n <= 0 ? 4 : n;
             }
             break;
             default:
@@ -404,7 +413,7 @@ int main(int argc, char *argv[])
     }
     else
     {
-        framesync_t *xFrameSync = framesync_create(&xFrameHeaderProps, 8);
+        framesync_t *xFrameSync = framesync_create(&xFrameHeaderProps, 8, ulNumDetectorThreads);
 
         framesync_set_callback(xFrameSync, packet_received_cb, NULL);
         framesync_set_header_soft_demod(xFrameSync, 0);
@@ -468,10 +477,12 @@ int main(int argc, char *argv[])
             }
 
             clock_t begin = clock();
-            framesync_process_samples(xFrameSync, pfBuffer, ulRead);
+            size_t ulProc = 0;
+            while(ulProc < ulRead)
+                ulProc += framesync_process_samples(xFrameSync, pfBuffer + ulProc, ulRead - ulProc);
             clock_t end = clock();
 
-            ullNumSamples += ulRead;
+            ullNumSamples += ulProc;
             dTotalTime += (double)(end - begin) / CLOCKS_PER_SEC;
         }
 

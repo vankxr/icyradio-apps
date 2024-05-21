@@ -1,7 +1,147 @@
 #include "framesync.h"
 
+typedef struct framesync_thread_data_t framesync_thread_data_t;
 
-static uint8_t flexframesync_step(framesync_t *fs, float complex sym, float complex *out)
+struct framesync_thread_data_t
+{
+    framesync_t *fs;
+    size_t idx;
+};
+
+static void *framesync_detector_thread_entry(void *p)
+{
+    framesync_thread_data_t *data = (framesync_thread_data_t *)p;
+
+    framesync_t *fs = data->fs;
+    size_t idx = data->idx;
+    qdetector_cccf detector = fs->detector[idx];
+
+    framesync_detector_buffer_t *buf = NULL;
+
+    while(1)
+    {
+        pthread_mutex_lock(&fs->detector_buf_mutex);
+
+        while(1)
+        {
+            if(buf) // Ensure the main thread released the buffer
+            {
+                while(buf->sync_buf)
+                {
+                    pthread_cond_wait(&fs->detector_buf_cond, &fs->detector_buf_mutex);
+
+                    if(!fs->detector_buf)
+                        break;
+                }
+
+                buf = NULL;
+
+                if(!fs->detector_buf)
+                    break;
+            }
+
+            while(!fs->detector_buf_len)
+            {
+                pthread_cond_wait(&fs->detector_buf_cond, &fs->detector_buf_mutex);
+
+                if(!fs->detector_buf)
+                    break;
+            }
+
+            size_t i = (fs->detector_n_threads + fs->detector_buf_head - 1) % fs->detector_n_threads;
+
+            for(size_t n = 0; n < fs->detector_n_threads; n++)
+            {
+                if(fs->detector_buf[i].state != FRAMESYNC_BUFFER_READY || !fs->detector_buf[i].buf || !fs->detector_buf[i].len)
+                {
+                    i = (i + 1) % fs->detector_n_threads;
+
+                    continue;
+                }
+
+                buf = &fs->detector_buf[i];
+
+                break;
+
+                i = (i + 1) % fs->detector_n_threads;
+            }
+
+            if(buf)
+                break;
+
+            pthread_cond_wait(&fs->detector_buf_cond, &fs->detector_buf_mutex);
+
+            if(!fs->detector_buf)
+                break;
+        }
+
+        if(!buf)
+        {
+            pthread_mutex_unlock(&fs->detector_buf_mutex);
+
+            break;
+        }
+
+        buf->state = FRAMESYNC_BUFFER_PROCESSING;
+
+        pthread_mutex_unlock(&fs->detector_buf_mutex);
+
+        pthread_mutex_lock(&fs->detector_mutex[idx]);
+
+        float complex *sync_buf = NULL;
+        float tau_hat = 0.0f;
+        float gamma_hat = 0.0f;
+        float dphi_hat = 0.0f;
+        float phi_hat = 0.0f;
+        size_t sync_len = 0;
+        size_t sync_pos = 0;
+
+        for(size_t i = 0; i < buf->len; i++)
+        {
+            sync_buf = qdetector_cccf_execute(detector, buf->buf[i]);
+
+            if(sync_buf == NULL)
+                continue;
+
+            tau_hat = qdetector_cccf_get_tau(detector);
+            gamma_hat = qdetector_cccf_get_gamma(detector);
+            dphi_hat = qdetector_cccf_get_dphi(detector);
+            phi_hat = qdetector_cccf_get_phi(detector);
+            sync_len = qdetector_cccf_get_buf_len(detector);
+            sync_pos = i + 1;
+
+            break;
+        }
+
+        pthread_mutex_unlock(&fs->detector_mutex[idx]);
+
+        pthread_mutex_lock(&fs->detector_buf_mutex);
+
+        if(buf->state == FRAMESYNC_BUFFER_PROCESSING)
+        {
+            buf->state = FRAMESYNC_BUFFER_PROCESSED;
+
+            if(sync_buf)
+            {
+                buf->sync_buf = sync_buf;
+                buf->sync_len = sync_len;
+                buf->sync_pos = sync_pos;
+                buf->stats.tau_hat = tau_hat;
+                buf->stats.gamma_hat = gamma_hat;
+                buf->stats.dphi_hat = dphi_hat;
+                buf->stats.phi_hat = phi_hat;
+            }
+        }
+
+        pthread_mutex_unlock(&fs->detector_buf_mutex);
+    }
+
+    free(p);
+
+    return NULL;
+}
+
+static uint8_t framesync_step(framesync_t *fs, float complex sym, float complex *out)
 {
     float complex v;
 
@@ -145,47 +285,11 @@ static void framesync_decode_header(framesync_t *fs)
     }
 }
 
-static void framesync_process_seekpn(framesync_t *fs, float complex sym)
-{
-    float complex *v = qdetector_cccf_execute(fs->detector, sym);
-
-    if(v == NULL)
-        return;
-
-    float tau_hat = qdetector_cccf_get_tau(fs->detector);
-    float gamma_hat = qdetector_cccf_get_gamma(fs->detector);
-    float dphi_hat = qdetector_cccf_get_dphi(fs->detector);
-    float phi_hat = qdetector_cccf_get_phi(fs->detector);
-
-    if(tau_hat > 0)
-    {
-        fs->mf_pfb_index = (unsigned int)roundf(tau_hat * fs->mf_npfb) % fs->mf_npfb;
-        fs->mf_counter = 0;
-    }
-    else
-    {
-        fs->mf_pfb_index = (unsigned int)roundf((1.0f + tau_hat) * fs->mf_npfb) % fs->mf_npfb;
-        fs->mf_counter = 1;
-    }
-
-    firpfb_crcf_set_scale(fs->mf, 0.5f / gamma_hat);
-
-    fs->detector_gamma_hat = gamma_hat;
-
-    nco_crcf_set_frequency(fs->mixer, dphi_hat);
-    nco_crcf_set_phase(fs->mixer, phi_hat);
-
-    fs->state = FRAMESYNC_STATE_RXDELAY;
-
-    size_t buf_len = qdetector_cccf_get_buf_len(fs->detector);
-
-    framesync_process_samples(fs, v, buf_len);
-}
 static void framesync_process_rxdelay(framesync_t *fs, float complex sym)
 {
     float complex mf_out = 0.0f;
 
-    if(!flexframesync_step(fs, sym, &mf_out))
+    if(!framesync_step(fs, sym, &mf_out))
         return;
 
 #if FRAMESYNC_ENABLE_EQ
@@ -206,7 +310,7 @@ static void framesync_process_rxpreamble(framesync_t *fs, float complex sym)
 {
     float complex mf_out = 0.0f;
 
-    if(!flexframesync_step(fs, sym, &mf_out))
+    if(!framesync_step(fs, sym, &mf_out))
         return;
 
     fs->preamble_rx[fs->preamble_counter] = mf_out;
@@ -227,7 +331,7 @@ static void framesync_process_rxheader(framesync_t *fs, float complex sym)
 {
     float complex mf_out = 0.0f;
 
-    if(!flexframesync_step(fs, sym, &mf_out))
+    if(!framesync_step(fs, sym, &mf_out))
         return;
 
     if(!fs->header_props.pilots)
@@ -259,7 +363,6 @@ static void framesync_process_rxheader(framesync_t *fs, float complex sym)
             if(fs->cb)
             {
                 fs->cb_stats.evm = fs->header_props.pilots ? qpilotsync_get_evm(fs->header_pilotsync) : 0.0f;
-                fs->cb_stats.rssi = 20.0f * log10f(fs->detector_gamma_hat);
                 fs->cb_stats.cfo = nco_crcf_get_frequency(fs->mixer);
 
                 fs->cb(fs->cb_ptr, &fs->cb_stats, fs->header_dec + 6, fs->header_valid, NULL, 0, 0, fs->header_is_last);
@@ -271,7 +374,7 @@ static void framesync_process_rxpayload(framesync_t *fs, float complex sym)
 {
     float complex mf_out = 0.0f;
 
-    if(!flexframesync_step(fs, sym, &mf_out))
+    if(!framesync_step(fs, sym, &mf_out))
         return;
 
     if(!fs->payload_props.pilots)
@@ -322,7 +425,6 @@ static void framesync_process_rxpayload(framesync_t *fs, float complex sym)
         if(fs->cb)
         {
             fs->cb_stats.evm = fs->payload_props.pilots ? qpilotsync_get_evm(fs->payload_pilotsync) : 10.0f * log10f(fs->cb_stats.evm / (float)fs->payload_sym_len);
-            fs->cb_stats.rssi = 20.0f * log10f(fs->detector_gamma_hat);
             fs->cb_stats.cfo = nco_crcf_get_frequency(fs->mixer);
 
             force_relock |= !!fs->cb(fs->cb_ptr, &fs->cb_stats, fs->header_dec + 6, fs->header_valid, fs->payload_dec, fs->payload_dec_len, fs->payload_valid, fs->header_is_last);
@@ -341,7 +443,193 @@ static void framesync_process_rxpayload(framesync_t *fs, float complex sym)
     }
 }
 
-framesync_t *framesync_create(framegenprops_t *h_props, size_t h_len)
+static size_t framesync_process_samples_int(framesync_t *fs, float complex *buffer, size_t buffer_len)
+{
+    if(fs->state == FRAMESYNC_STATE_DETECTFRAME)
+    {
+        if(fs->detector_buf_len >= fs->detector_n_threads)
+        {
+            sched_yield();
+
+            return 0;
+        }
+
+        framesync_detector_buffer_t *buf = &fs->detector_buf[fs->detector_buf_head];
+
+        pthread_mutex_lock(&fs->detector_buf_mutex);
+
+        if(buf->state != FRAMESYNC_BUFFER_CONSUMED)
+        {
+            pthread_mutex_unlock(&fs->detector_buf_mutex);
+
+            return 0;
+        }
+
+        pthread_mutex_unlock(&fs->detector_buf_mutex);
+
+        if(buf->len != buffer_len)
+            buf->buf = (float complex *)realloc(buf->buf, buffer_len * sizeof(float complex));
+
+        if(!buf->buf)
+            return 0;
+
+        buf->len = buffer_len;
+        memmove(buf->buf, buffer, buffer_len * sizeof(float complex));
+
+        pthread_mutex_lock(&fs->detector_buf_mutex);
+
+        buf->state = FRAMESYNC_BUFFER_READY;
+
+        fs->detector_buf_len++;
+        fs->detector_buf_head = (fs->detector_buf_head + 1) % fs->detector_n_threads;
+        pthread_cond_broadcast(&fs->detector_buf_cond);
+
+        pthread_mutex_unlock(&fs->detector_buf_mutex);
+
+        fprintf(stderr, "Loaded buffer %zu\n", (fs->detector_n_threads + fs->detector_buf_head - 1) % fs->detector_n_threads);
+
+        return buffer_len;
+    }
+
+    for(size_t i = 0; i < buffer_len; i++)
+    {
+        switch(fs->state)
+        {
+            case FRAMESYNC_STATE_DETECTFRAME:
+                return i;
+            break;
+            case FRAMESYNC_STATE_RXDELAY:
+                framesync_process_rxdelay(fs, buffer[i]);
+            break;
+            case FRAMESYNC_STATE_RXPREAMBLE:
+                framesync_process_rxpreamble(fs, buffer[i]);
+            break;
+            case FRAMESYNC_STATE_RXHEADER:
+                framesync_process_rxheader(fs, buffer[i]);
+            break;
+            case FRAMESYNC_STATE_RXPAYLOAD:
+                framesync_process_rxpayload(fs, buffer[i]);
+            break;
+        }
+    }
+
+    return buffer_len;
+}
+static void framesync_process_detector_out(framesync_t *fs)
+{
+    uint8_t f = 1;
+
+    while(fs->detector_buf_len)
+    {
+        framesync_detector_buffer_t *buf = &fs->detector_buf[fs->detector_buf_tail];
+
+        pthread_mutex_lock(&fs->detector_buf_mutex);
+
+        if(fs->state == FRAMESYNC_STATE_DETECTFRAME && buf->state != FRAMESYNC_BUFFER_PROCESSED)
+        {
+            pthread_mutex_unlock(&fs->detector_buf_mutex);
+
+            return; // We must process the buffers in order
+        }
+
+        fs->detector_buf_len--;
+        fs->detector_buf_tail = (fs->detector_buf_tail + 1) % fs->detector_n_threads;
+
+        buf->state = FRAMESYNC_BUFFER_CONSUMED;
+
+        if(fs->state == FRAMESYNC_STATE_DETECTFRAME)
+        {
+            if(!buf->sync_buf) // Nothing found in this buffer
+            {
+                pthread_mutex_unlock(&fs->detector_buf_mutex);
+
+                continue;
+            }
+        }
+        else
+        {
+            buf->sync_buf = NULL;
+
+            if(buf->state != FRAMESYNC_BUFFER_PROCESSING)
+                pthread_cond_broadcast(&fs->detector_buf_cond);
+        }
+
+        pthread_mutex_unlock(&fs->detector_buf_mutex);
+
+        // We can work with buf directly here without the mutex lock since we guarantee the state is DONE, hence, no one else will touch it
+        if(fs->state == FRAMESYNC_STATE_DETECTFRAME)
+        {
+            fprintf(stderr, "Frame found in buffer %zu %hhu\n", (fs->detector_n_threads + fs->detector_buf_tail - 1) % fs->detector_n_threads, f); f = 0;
+
+            if(buf->stats.tau_hat > 0)
+            {
+                fs->mf_pfb_index = (unsigned int)roundf(buf->stats.tau_hat * fs->mf_npfb) % fs->mf_npfb;
+                fs->mf_counter = 0;
+            }
+            else
+            {
+                fs->mf_pfb_index = (unsigned int)roundf((1.0f + buf->stats.tau_hat) * fs->mf_npfb) % fs->mf_npfb;
+                fs->mf_counter = 1;
+            }
+
+            firpfb_crcf_set_scale(fs->mf, 0.5f / buf->stats.gamma_hat);
+
+            fs->cb_stats.rssi = 20.0f * log10f(buf->stats.gamma_hat);
+
+            nco_crcf_set_frequency(fs->mixer, buf->stats.dphi_hat);
+            nco_crcf_set_phase(fs->mixer, buf->stats.phi_hat);
+
+            fs->state = FRAMESYNC_STATE_RXDELAY;
+
+            fprintf(stderr, "Proc sync\n");
+            framesync_process_samples_int(fs, buf->sync_buf, buf->sync_len); // Process the synced preamble
+
+            pthread_mutex_lock(&fs->detector_buf_mutex);
+            buf->sync_buf = NULL; // Signal the detector thread that it can release this buffer
+            pthread_cond_broadcast(&fs->detector_buf_cond);
+            pthread_mutex_unlock(&fs->detector_buf_mutex);
+
+            if(buf->sync_pos < buf->len) // Process the remaining of this buffer
+            {
+                size_t _len = buf->len - buf->sync_pos;
+                float complex *_buf = (float complex *)malloc(_len * sizeof(float complex));
+
+                if(_buf)
+                {
+                    memmove(_buf, buf->buf + buf->sync_pos, _len * sizeof(float complex));
+
+            fprintf(stderr, "Proc rem\n");
+                    size_t proc = 0;
+
+                    while(proc < _len)
+                        proc += framesync_process_samples_int(fs, _buf + proc, _len- proc);
+
+                    free(_buf);
+                }
+            }
+        }
+        else
+        {
+            fprintf(stderr, "Proc buffer %zu\n", (fs->detector_n_threads + fs->detector_buf_tail - 1) % fs->detector_n_threads);
+            float complex *_buf = (float complex *)malloc(buf->len * sizeof(float complex));
+
+            if(_buf)
+            {
+                memmove(_buf, buf->buf, buf->len * sizeof(float complex));
+
+                size_t proc = 0;
+
+                while(proc < buf->len)
+                    proc += framesync_process_samples_int(fs, _buf + proc, buf->len - proc);
+
+                free(_buf);
+            }
+        }
+    }
+}
+
+
+framesync_t *framesync_create(framegenprops_t *h_props, size_t h_len, size_t n_det_threads)
 {
     if(!h_props)
         return NULL;
@@ -356,6 +644,9 @@ framesync_t *framesync_create(framegenprops_t *h_props, size_t h_len)
         return NULL;
 
     if(h_props->mod == LIQUID_MODEM_UNKNOWN || h_props->mod >= LIQUID_MODEM_NUM_SCHEMES)
+        return NULL;
+
+    if(!n_det_threads)
         return NULL;
 
     framesync_t *fs = (framesync_t *)malloc(sizeof(framesync_t));
@@ -377,7 +668,7 @@ framesync_t *framesync_create(framegenprops_t *h_props, size_t h_len)
 
     msequence ms = msequence_create_default(7);
 
-    for(uint8_t i = 0; i < 64; i++)
+    for(size_t i = 0; i < 64; i++)
     {
         fs->preamble_pn[i] = (msequence_advance(ms) ? M_SQRT1_2 : -M_SQRT1_2);
         fs->preamble_pn[i] += (msequence_advance(ms) ? M_SQRT1_2 : -M_SQRT1_2) * _Complex_I;
@@ -395,12 +686,104 @@ framesync_t *framesync_create(framegenprops_t *h_props, size_t h_len)
         return NULL;
     }
 
+    fs->detector_n_threads = n_det_threads;
+    fs->detector_thread = (pthread_t *)malloc(n_det_threads * sizeof(pthread_t));
+
+    if(!fs->detector_thread)
+    {
+        free(fs->preamble_rx);
+        free(fs->preamble_pn);
+        free(fs);
+
+        return NULL;
+    }
+
     fs->detector_k = 2;
     fs->detector_m = 8;
     fs->detector_beta = 0.15f;
-    fs->detector = qdetector_cccf_create_linear(fs->preamble_pn, 64, LIQUID_FIRFILT_RRC, fs->detector_k, fs->detector_m, fs->detector_beta);
+    fs->detector_mutex = (pthread_mutex_t *)malloc(n_det_threads * sizeof(pthread_mutex_t));
 
-    qdetector_cccf_set_threshold(fs->detector, 0.5f);
+    if(!fs->detector_mutex)
+    {
+        free(fs->detector_thread);
+        free(fs->preamble_rx);
+        free(fs->preamble_pn);
+        free(fs);
+
+        return NULL;
+    }
+
+    fs->detector = (qdetector_cccf *)malloc(n_det_threads * sizeof(qdetector_cccf));
+
+    if(!fs->detector)
+    {
+        free(fs->detector_mutex);
+        free(fs->detector_thread);
+        free(fs->preamble_rx);
+        free(fs->preamble_pn);
+        free(fs);
+
+        return NULL;
+    }
+
+    pthread_mutex_init(&fs->detector_buf_mutex, NULL);
+    pthread_cond_init(&fs->detector_buf_cond, NULL);
+
+    fs->detector_buf = (framesync_detector_buffer_t *)malloc(n_det_threads * sizeof(framesync_detector_buffer_t));
+
+    if(!fs->detector_buf)
+    {
+        free(fs->detector);
+        free(fs->detector_mutex);
+        free(fs->detector_thread);
+        free(fs->preamble_rx);
+        free(fs->preamble_pn);
+        free(fs);
+
+        return NULL;
+    }
+
+    fs->detector_buf_len = 0;
+    fs->detector_buf_head = 0;
+    fs->detector_buf_tail = 0;
+
+    for(size_t i = 0; i < n_det_threads; i++)
+    {
+        pthread_mutex_init(&fs->detector_mutex[i], NULL);
+
+        fs->detector[i] = qdetector_cccf_create_linear(fs->preamble_pn, 64, LIQUID_FIRFILT_RRC, fs->detector_k, fs->detector_m, fs->detector_beta);
+
+        qdetector_cccf_set_threshold(fs->detector[i], 0.5f);
+
+        fs->detector_buf[i].buf = NULL;
+        fs->detector_buf[i].len = 0;
+        fs->detector_buf[i].state = FRAMESYNC_BUFFER_CONSUMED;
+        fs->detector_buf[i].sync_buf = NULL;
+        fs->detector_buf[i].sync_len = 0;
+        fs->detector_buf[i].sync_pos = 0;
+
+        framesync_thread_data_t *data = (framesync_thread_data_t *)malloc(sizeof(framesync_thread_data_t));
+
+        if(!data)
+        {
+            for(size_t j = 0; j < i; j++)
+                qdetector_cccf_destroy(fs->detector[j]);
+
+            free(fs->detector);
+            free(fs->detector_mutex);
+            free(fs->detector_thread);
+            free(fs->preamble_rx);
+            free(fs->preamble_pn);
+            free(fs);
+
+            return NULL;
+        }
+
+        data->fs = fs;
+        data->idx = i;
+
+        pthread_create(&fs->detector_thread[i], NULL, framesync_detector_thread_entry, data);
+    }
 
     fs->mf_k = 2;
     fs->mf_m = 8;
@@ -425,6 +808,10 @@ framesync_t *framesync_create(framegenprops_t *h_props, size_t h_len)
 
     if(!fs->header_dec)
     {
+        free(fs->detector_buf);
+        free(fs->detector);
+        free(fs->detector_mutex);
+        free(fs->detector_thread);
         free(fs->preamble_rx);
         free(fs->preamble_pn);
         free(fs);
@@ -443,6 +830,10 @@ framesync_t *framesync_create(framegenprops_t *h_props, size_t h_len)
     if(!fs->header_mod)
     {
         free(fs->header_dec);
+        free(fs->detector_buf);
+        free(fs->detector);
+        free(fs->detector_mutex);
+        free(fs->detector_thread);
         free(fs->preamble_rx);
         free(fs->preamble_pn);
         free(fs);
@@ -458,6 +849,10 @@ framesync_t *framesync_create(framegenprops_t *h_props, size_t h_len)
     {
         free(fs->header_mod);
         free(fs->header_dec);
+        free(fs->detector_buf);
+        free(fs->detector);
+        free(fs->detector_mutex);
+        free(fs->detector_thread);
         free(fs->preamble_rx);
         free(fs->preamble_pn);
         free(fs);
@@ -495,13 +890,59 @@ void framesync_delete(framesync_t *fs)
 #endif
     nco_crcf_destroy(fs->mixer);
     firpfb_crcf_destroy(fs->mf);
-    qdetector_cccf_destroy(fs->detector);
+
+    pthread_mutex_lock(&fs->detector_buf_mutex);
+
+    while(1)
+    {
+        uint8_t all_done = 1;
+
+        for(size_t i = 0; i < fs->detector_n_threads; i++)
+        {
+            if(fs->detector_buf[i].state == FRAMESYNC_BUFFER_PROCESSING)
+            {
+                all_done = 0;
+
+                break;
+            }
+        }
+
+        if(all_done)
+            break;
+
+        pthread_mutex_unlock(&fs->detector_buf_mutex);
+        sched_yield();
+        pthread_mutex_lock(&fs->detector_buf_mutex);
+    }
+
+    framesync_detector_buffer_t *_b = fs->detector_buf;
+    fs->detector_buf = NULL;
+    pthread_cond_broadcast(&fs->detector_buf_cond);
+
+    pthread_mutex_unlock(&fs->detector_buf_mutex);
+
+    for(size_t i = 0; i < fs->detector_n_threads; i++)
+        pthread_join(fs->detector_thread[i], NULL);
+
+    fs->detector_buf = _b;
+
+    for(size_t i = 0; i < fs->detector_n_threads; i++)
+    {
+        qdetector_cccf_destroy(fs->detector[i]);
+
+        if(fs->detector_buf[i].buf)
+            free(fs->detector_buf[i].buf);
+    }
 
     free(fs->payload_sym);
     free(fs->payload_dec);
     free(fs->header_sym);
     free(fs->header_mod);
     free(fs->header_dec);
+    free(fs->detector_buf);
+    free(fs->detector);
+    free(fs->detector_mutex);
+    free(fs->detector_thread);
     free(fs->preamble_rx);
     free(fs->preamble_pn);
     free(fs);
@@ -511,7 +952,15 @@ void framesync_reset(framesync_t *fs)
     if(!fs)
         return;
 
-    qdetector_cccf_reset(fs->detector);
+    for(size_t i = 0; i < fs->detector_n_threads; i++)
+    {
+        pthread_mutex_lock(&fs->detector_mutex[i]);
+
+        qdetector_cccf_reset(fs->detector[i]);
+
+        pthread_mutex_unlock(&fs->detector_mutex[i]);
+    }
+
     firpfb_crcf_reset(fs->mf);
     nco_crcf_reset(fs->mixer);
 #if FRAMESYNC_ENABLE_EQ
@@ -565,30 +1014,18 @@ void framesync_set_payload_soft_demod(framesync_t *fs, uint8_t soft)
 
     fs->payload_soft = !!soft;
 }
-void framesync_process_samples(framesync_t *fs, float complex *buffer, size_t buffer_len)
+size_t framesync_process_samples(framesync_t *fs, float complex *buffer, size_t buffer_len)
 {
-    if(!fs || !buffer || !buffer_len)
-        return;
+    if(!fs)
+        return 0;
 
-    for(size_t i = 0; i < buffer_len; i++)
-    {
-        switch(fs->state)
-        {
-            case FRAMESYNC_STATE_DETECTFRAME:
-                framesync_process_seekpn(fs, buffer[i]);
-            break;
-            case FRAMESYNC_STATE_RXDELAY:
-                framesync_process_rxdelay(fs, buffer[i]);
-            break;
-            case FRAMESYNC_STATE_RXPREAMBLE:
-                framesync_process_rxpreamble(fs, buffer[i]);
-            break;
-            case FRAMESYNC_STATE_RXHEADER:
-                framesync_process_rxheader(fs, buffer[i]);
-            break;
-            case FRAMESYNC_STATE_RXPAYLOAD:
-                framesync_process_rxpayload(fs, buffer[i]);
-            break;
-        }
-    }
+    if(buffer_len && !buffer)
+        return 0;
+
+    framesync_process_detector_out(fs);
+
+    if(!buffer || !buffer_len)
+        return 0;
+
+    return framesync_process_samples_int(fs, buffer, buffer_len);
 }
