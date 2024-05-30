@@ -43,7 +43,6 @@ struct framesync_t
     unsigned int                   detector_m;         // filter delay (symbols)
     float                          detector_beta;      // filter excess bandwidth factor
     qdetector_cccf                 detector;           // pre-demod detector
-    float                          detector_gamma_hat; // channel gain estimate
 
     // timing recovery objects, states
     unsigned int                   mf_k;               // matched filter samples/symbol (fixed at 2)

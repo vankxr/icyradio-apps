@@ -6,7 +6,7 @@
         {
             "label": "Build (remote x86)",
             "type": "shell",
-            "command": "scp -r -p ../../icyradio-apps icyradio-x86-0.lan:~ && ssh icyradio-x86-0.lan \"cd ~/icyradio-apps/ts-streamer && make clean && make\"",
+            "command": "scp -r -p ./src icyradio-x86-0.lan:~/icyradio-apps/ts-streamer/ && ssh icyradio-x86-0.lan \"cd ~/icyradio-apps/ts-streamer && make clean && make\"",
             "group": {
                 "kind": "build",
                 "isDefault": false
@@ -15,7 +15,7 @@
         {
             "label": "Build (remote ARM)",
             "type": "shell",
-            "command": "scp -r -p ../../icyradio-apps icyradio1.lan:~ && ssh icyradio1.lan \"cd ~/icyradio-apps/ts-streamer && make clean && make\"",
+            "command": "scp -r -p ./src icyradio1.lan:~/icyradio-apps/ts-streamer/ && ssh icyradio1.lan \"cd ~/icyradio-apps/ts-streamer && make clean && make\"",
             "group": {
                 "kind": "build",
                 "isDefault": false

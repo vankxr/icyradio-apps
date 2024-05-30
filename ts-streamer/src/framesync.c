@@ -1,7 +1,7 @@
 #include "framesync.h"
 
 
-static uint8_t flexframesync_step(framesync_t *fs, float complex sym, float complex *out)
+static uint8_t framesync_step(framesync_t *fs, float complex sym, float complex *out)
 {
     float complex v;
 
@@ -52,7 +52,7 @@ static void framesync_decode_header(framesync_t *fs)
         float dphi_hat = qpilotsync_get_dphi(fs->header_pilotsync);
         float phi_hat = qpilotsync_get_phi(fs->header_pilotsync);
 
-        // nco_crcf_adjust_frequency(fs->mixer, dphi_hat);
+        nco_crcf_adjust_frequency(fs->mixer, dphi_hat);
         nco_crcf_adjust_phase(fs->mixer, phi_hat + dphi_hat * fs->header_sym_len);
 
         // firpfb_crcf_set_scale(fs->mf, 0.5f / gamma_hat);
@@ -120,7 +120,7 @@ static void framesync_decode_header(framesync_t *fs)
         return;
     }
 
-    qpacketmodem_configure(fs->payload_decoder, payload_dec_len, crc, i_fec, o_fec, mod);
+    qpacketmodem_configure(fs->payload_decoder, payload_dec_len, crc, o_fec, i_fec, mod);
 
     fs->payload_demod = modemcf_recreate(fs->payload_demod, mod);
     fs->payload_mod_len = qpacketmodem_get_frame_len(fs->payload_decoder);
@@ -170,7 +170,7 @@ static void framesync_process_seekpn(framesync_t *fs, float complex sym)
 
     firpfb_crcf_set_scale(fs->mf, 0.5f / gamma_hat);
 
-    fs->detector_gamma_hat = gamma_hat;
+    fs->cb_stats.rssi = 20.0f * log10f(gamma_hat);
 
     nco_crcf_set_frequency(fs->mixer, dphi_hat);
     nco_crcf_set_phase(fs->mixer, phi_hat);
@@ -185,7 +185,7 @@ static void framesync_process_rxdelay(framesync_t *fs, float complex sym)
 {
     float complex mf_out = 0.0f;
 
-    if(!flexframesync_step(fs, sym, &mf_out))
+    if(!framesync_step(fs, sym, &mf_out))
         return;
 
 #if FRAMESYNC_ENABLE_EQ
@@ -206,7 +206,7 @@ static void framesync_process_rxpreamble(framesync_t *fs, float complex sym)
 {
     float complex mf_out = 0.0f;
 
-    if(!flexframesync_step(fs, sym, &mf_out))
+    if(!framesync_step(fs, sym, &mf_out))
         return;
 
     fs->preamble_rx[fs->preamble_counter] = mf_out;
@@ -227,7 +227,7 @@ static void framesync_process_rxheader(framesync_t *fs, float complex sym)
 {
     float complex mf_out = 0.0f;
 
-    if(!flexframesync_step(fs, sym, &mf_out))
+    if(!framesync_step(fs, sym, &mf_out))
         return;
 
     if(!fs->header_props.pilots)
@@ -259,7 +259,6 @@ static void framesync_process_rxheader(framesync_t *fs, float complex sym)
             if(fs->cb)
             {
                 fs->cb_stats.evm = fs->header_props.pilots ? qpilotsync_get_evm(fs->header_pilotsync) : 0.0f;
-                fs->cb_stats.rssi = 20.0f * log10f(fs->detector_gamma_hat);
                 fs->cb_stats.cfo = nco_crcf_get_frequency(fs->mixer);
 
                 fs->cb(fs->cb_ptr, &fs->cb_stats, fs->header_dec + 6, fs->header_valid, NULL, 0, 0, fs->header_is_last);
@@ -271,7 +270,7 @@ static void framesync_process_rxpayload(framesync_t *fs, float complex sym)
 {
     float complex mf_out = 0.0f;
 
-    if(!flexframesync_step(fs, sym, &mf_out))
+    if(!framesync_step(fs, sym, &mf_out))
         return;
 
     if(!fs->payload_props.pilots)
@@ -311,7 +310,7 @@ static void framesync_process_rxpayload(framesync_t *fs, float complex sym)
             float dphi_hat = qpilotsync_get_dphi(fs->payload_pilotsync);
             float phi_hat = qpilotsync_get_phi(fs->payload_pilotsync);
 
-            // nco_crcf_adjust_frequency(fs->mixer, dphi_hat);
+            nco_crcf_adjust_frequency(fs->mixer, dphi_hat);
             nco_crcf_adjust_phase(fs->mixer, phi_hat + dphi_hat * fs->payload_sym_len);
 
             // firpfb_crcf_set_scale(fs->mf, 0.5f / gamma_hat);
@@ -322,7 +321,6 @@ static void framesync_process_rxpayload(framesync_t *fs, float complex sym)
         if(fs->cb)
         {
             fs->cb_stats.evm = fs->payload_props.pilots ? qpilotsync_get_evm(fs->payload_pilotsync) : 10.0f * log10f(fs->cb_stats.evm / (float)fs->payload_sym_len);
-            fs->cb_stats.rssi = 20.0f * log10f(fs->detector_gamma_hat);
             fs->cb_stats.cfo = nco_crcf_get_frequency(fs->mixer);
 
             force_relock |= !!fs->cb(fs->cb_ptr, &fs->cb_stats, fs->header_dec + 6, fs->header_valid, fs->payload_dec, fs->payload_dec_len, fs->payload_valid, fs->header_is_last);
@@ -377,7 +375,7 @@ framesync_t *framesync_create(framegenprops_t *h_props, size_t h_len)
 
     msequence ms = msequence_create_default(7);
 
-    for(uint8_t i = 0; i < 64; i++)
+    for(size_t i = 0; i < 64; i++)
     {
         fs->preamble_pn[i] = (msequence_advance(ms) ? M_SQRT1_2 : -M_SQRT1_2);
         fs->preamble_pn[i] += (msequence_advance(ms) ? M_SQRT1_2 : -M_SQRT1_2) * _Complex_I;
@@ -396,16 +394,17 @@ framesync_t *framesync_create(framegenprops_t *h_props, size_t h_len)
     }
 
     fs->detector_k = 2;
-    fs->detector_m = 8;
-    fs->detector_beta = 0.15f;
+    fs->detector_m = 7;
+    fs->detector_beta = 0.3f;
     fs->detector = qdetector_cccf_create_linear(fs->preamble_pn, 64, LIQUID_FIRFILT_RRC, fs->detector_k, fs->detector_m, fs->detector_beta);
 
-    qdetector_cccf_set_threshold(fs->detector, 0.5f);
+    qdetector_cccf_set_threshold(fs->detector, 0.6f);
+    qdetector_cccf_set_range(fs->detector, 0.05f);
 
     fs->mf_k = 2;
-    fs->mf_m = 8;
-    fs->mf_beta = 0.15f;
-    fs->mf_npfb = 128;
+    fs->mf_m = 7;
+    fs->mf_beta = 0.25f;
+    fs->mf_npfb = 64;
     fs->mf = firpfb_crcf_create_rnyquist(LIQUID_FIRFILT_RRC, fs->mf_npfb, fs->mf_k, fs->mf_m, fs->mf_beta);
 
     fs->mixer = nco_crcf_create(LIQUID_NCO);
@@ -434,7 +433,7 @@ framesync_t *framesync_create(framegenprops_t *h_props, size_t h_len)
 
     fs->header_decoder = qpacketmodem_create();
 
-    qpacketmodem_configure(fs->header_decoder, fs->header_dec_len, fs->header_props.crc, fs->header_props.i_fec, fs->header_props.o_fec, fs->header_props.mod);
+    qpacketmodem_configure(fs->header_decoder, fs->header_dec_len, fs->header_props.crc, fs->header_props.o_fec, fs->header_props.i_fec, fs->header_props.mod);
 
     fs->header_demod = modemcf_create(fs->header_props.mod);
     fs->header_mod_len = qpacketmodem_get_frame_len(fs->header_decoder);

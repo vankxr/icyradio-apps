@@ -2,7 +2,7 @@
 
 static void framegen_reconfigure(framegen_t *fg)
 {
-    qpacketmodem_configure(fg->payload_encoder, fg->payload_dec_len, fg->payload_props.crc, fg->payload_props.i_fec, fg->payload_props.o_fec, fg->payload_props.mod);
+    qpacketmodem_configure(fg->payload_encoder, fg->payload_dec_len, fg->payload_props.crc, fg->payload_props.o_fec, fg->payload_props.i_fec, fg->payload_props.mod);
 
     fg->payload_mod_len = qpacketmodem_get_frame_len(fg->payload_encoder);
     fg->payload_mod = (float complex *)realloc(fg->payload_mod, fg->payload_mod_len * sizeof(float complex));
@@ -117,8 +117,8 @@ framegen_t * framegen_create(framegenprops_t *h_props, size_t h_len)
         return NULL;
 
     fg->interp_k = 2;
-    fg->interp_m = 8;
-    fg->interp_beta = 0.15f;
+    fg->interp_m = 7;
+    fg->interp_beta = 0.25f;
     fg->interp = firinterp_crcf_create_prototype(LIQUID_FIRFILT_RRC, fg->interp_k, fg->interp_m, fg->interp_beta, 0);
     fg->interp_buf = (float complex *)malloc(fg->interp_k * sizeof(float complex));
 
@@ -169,7 +169,7 @@ framegen_t * framegen_create(framegenprops_t *h_props, size_t h_len)
 
     fg->header_encoder = qpacketmodem_create();
 
-    qpacketmodem_configure(fg->header_encoder, fg->header_dec_len, fg->header_props.crc, fg->header_props.i_fec, fg->header_props.o_fec, fg->header_props.mod);
+    qpacketmodem_configure(fg->header_encoder, fg->header_dec_len, fg->header_props.crc, fg->header_props.o_fec, fg->header_props.i_fec, fg->header_props.mod);
 
     fg->header_mod_len = qpacketmodem_get_frame_len(fg->header_encoder);
     fg->header_mod = (float complex *)malloc(fg->header_mod_len * sizeof(float complex));

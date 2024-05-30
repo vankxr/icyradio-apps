@@ -16,6 +16,7 @@
 #define TS_PACKET_LEN 187 // 188 bytes per TS packet, sync byte extracted
 
 uint8_t g_ubDummyMode = 0;
+uint8_t g_ubQuietMode = 0;
 volatile uint8_t g_ubStop = 0;
 
 uint8_t packet_received_cb(void *ptr, const framesync_stats_t *stats, const uint8_t *header, const uint8_t header_valid, const uint8_t *payload, const size_t payload_len, const uint8_t payload_valid, const uint8_t is_last)
@@ -26,21 +27,37 @@ uint8_t packet_received_cb(void *ptr, const framesync_stats_t *stats, const uint
     // DBGPRINTLN_CTX("Packet received (H %s%s, P: (%lu bytes, %s], RSSI: %.2f dB, EVM: %.2f dB, CFO %.2f %%Fs)", header_valid ? "OK" : "FAIL", is_last ? " [LAST]" : "", payload_len, payload_valid ? "OK" : "FAIL", stats->rssi, stats->evm, stats->cfo * 100);
 
     static uint64_t ullTotalPackets = 0;
-    static uint64_t ullFailedPackets = 0;
+    static uint64_t ullTotalFailedPackets = 0;
+    static uint64_t ullTotalLostPackets = 0;
     static uint64_t ullLastPacket = 0;
     uint64_t ullPacket = *(uint64_t *)header;
+    int64_t llLostPackets = ullPacket - ullLastPacket - 1;
+    uint8_t ubPrintStats = !payload_valid || !!llLostPackets;
 
-    if(ullPacket != ullLastPacket + 1)
-        DBGPRINTLN_CTX("At least %ld packets lost", ullPacket - ullLastPacket);
+    ullLastPacket = ullPacket;
 
     ullTotalPackets++;
+    ullTotalFailedPackets += !payload_valid;
 
-    // if(!payload_valid)
-    // {
-        DBGPRINTLN_CTX("Packet received (H %s%s, P: [%lu bytes, %s], RSSI: %.2f dB, EVM: %.2f dB, CFO %.2f %%Fs)", header_valid ? "OK" : "FAIL", is_last ? " [LAST]" : "", payload_len, payload_valid ? "OK" : "FAIL", stats->rssi, stats->evm, stats->cfo * 100);
-    //     ullFailedPackets++;
-    //     DBGPRINTLN_CTX("Total packets: %lu, failed packets: %lu, failed rate: %.2f %%", ullTotalPackets, ullFailedPackets, (float)ullFailedPackets / ullTotalPackets * 100);
-    // }
+    if(llLostPackets > 0 && (uint64_t)llLostPackets < ullTotalPackets)
+    {
+        ullTotalLostPackets += llLostPackets;
+
+        DBGPRINTLN_CTX("At least %ld packets lost", llLostPackets);
+    }
+
+    if(ubPrintStats)
+        DBGPRINTLN_CTX("Total packets: %lu, failed packets: %lu (%.2f %%), lost packets: %lu (%.2f %%)", ullTotalPackets, ullTotalFailedPackets, (double)ullTotalFailedPackets / ullTotalPackets * 100, ullTotalLostPackets, (double)ullTotalLostPackets / ullTotalPackets * 100);
+
+    if(!g_ubQuietMode)
+    {
+        DBGPRINTLN_CTX("Packet %lu received (H %s%s, P: [%lu bytes, %s], RSSI: %.2f dB, EVM: %.2f dB, CFO %.2f %%Fs)", ullPacket, header_valid ? "OK" : "FAIL", is_last ? " [LAST]" : "", payload_len, payload_valid ? "OK" : "FAIL", stats->rssi, stats->evm, stats->cfo * 100);
+
+        // DBGPRINT_CTX("  Header: ");
+        // for(int i = 0; i < 14; i++)
+        //     DBGPRINT("%02X ", pubHeader[i]);
+        // DBGPRINTLN("");
+    }
 
     if(!g_ubDummyMode)
     {
@@ -60,16 +77,6 @@ uint8_t packet_received_cb(void *ptr, const framesync_stats_t *stats, const uint
         }
     }
 
-    // DBGPRINT_CTX("  Header: ");
-    // for(int i = 0; i < 14; i++)
-    //     DBGPRINT("%02X ", pubHeader[i]);
-    // DBGPRINTLN("");
-
-    // DBGPRINTLN_CTX("  Packet ID: %lu", ullPacket);
-
-    ullLastPacket = ullPacket;
-
-    return 1;
     return stats->evm > -13;
 }
 void signal_handler(int iSignal)
@@ -99,15 +106,16 @@ int main(int argc, char *argv[])
     size_t ulNumTSFramesPerPacket = 32;
 
     int iOpt;
-    while((iOpt = getopt(argc, argv, "hdztrg:af:s:n:")) != EOF)
+    while((iOpt = getopt(argc, argv, "hdqztrg:af:s:n:")) != EOF)
     {
         switch(iOpt)
         {
             case 'h':
             {
-                DBGPRINTLN("Usage: %s [-h] [-d] [-z] [-t] [-r] [-g <gain_dB>] [-a] [-f <freq>] [-s <rate>] [-n <num>]", argv[0]);
+                DBGPRINTLN("Usage: %s [-h] [-d] [-q] [-z] [-t] [-r] [-g <gain_dB>] [-a] [-f <freq>] [-s <rate>] [-n <num>]", argv[0]);
                 DBGPRINTLN("  -h: Print this help message");
                 DBGPRINTLN("  -d: Dummy mode (generate random TX data and discard RX data)");
+                DBGPRINTLN("  -q: Quiet mode (no verbose debug output)");
                 DBGPRINTLN("  -z: No radio mode (RX outputs samples to stdout and TX reads samples from stdin)");
                 DBGPRINTLN("  -t: TX mode");
                 DBGPRINTLN("  -r: RX mode (default)");
@@ -123,6 +131,11 @@ int main(int argc, char *argv[])
             case 'd':
             {
                 g_ubDummyMode = 1;
+            }
+            break;
+            case 'q':
+            {
+                g_ubQuietMode = 1;
             }
             break;
             case 'z':
@@ -215,17 +228,17 @@ int main(int argc, char *argv[])
     // Modulation parameters
     framegenprops_t xFrameHeaderProps = {
         .crc = LIQUID_CRC_8,
-        .i_fec = LIQUID_FEC_CONV_V27P78,
+        .i_fec = LIQUID_FEC_NONE,
         .o_fec = LIQUID_FEC_NONE,
         .mod = LIQUID_MODEM_BPSK,
         .pilots = 0,
     };
     framegenprops_t xFramePayloadProps = {
         .crc = LIQUID_CRC_8,
-        .i_fec = LIQUID_FEC_CONV_V29P78,
-        .o_fec = LIQUID_FEC_RS_M8_DVB,
+        .i_fec = LIQUID_FEC_CONV_V27P78,
+        .o_fec = LIQUID_FEC_RS_M8_K239_CCSDS,
         .mod = LIQUID_MODEM_QPSK,
-        .pilots = 1,
+        .pilots = 0,
     };
 
     uint64_t ullNumSamples = 0;
@@ -295,7 +308,7 @@ int main(int argc, char *argv[])
             SoapySDRDevice_setBandwidth(pSDR, SOAPY_SDR_TX, 0, fSampleRate * 0.75);
             SoapySDRDevice_setFrequency(pSDR, SOAPY_SDR_TX, 0, fCarrierFreq, NULL);
             SoapySDRDevice_setAntenna(pSDR, SOAPY_SDR_TX, 0, "TX1A");
-            SoapySDRDevice_setGainElement(pSDR, SOAPY_SDR_TX, 0, "TX_ATT", fGain);
+            SoapySDRDevice_setGain(pSDR, SOAPY_SDR_TX, 0, fGain);
         }
 
         SoapySDRStream *pStream = NULL;
@@ -355,11 +368,6 @@ int main(int argc, char *argv[])
                 ulSamples = framegen_write_samples(xFrameGen, pfBuffer, ulSamples);
                 ulSamplesLeft -= ulSamples;
 
-                int iFlags = 0;
-
-                if(!ulSamplesLeft)
-                    iFlags |= SOAPY_SDR_END_BURST;
-
                 size_t ulOffset = 0;
 
                 while(ulSamples)
@@ -368,7 +376,14 @@ int main(int argc, char *argv[])
 
                     if(pSDR)
                     {
-                        int iWritten = SoapySDRDevice_writeStream(pSDR, pStream, (const void * const *)&pfBuffer[ulOffset], ulSamples, &iFlags, 0, 1e6);
+                        void *pSamples = (void *)&pfBuffer[ulOffset];
+                        int iFlags = 0;
+
+                        // End burst only if no samples left and framegen_assemble was called with last parameter to true (last packet)
+                        if(!ulSamplesLeft)
+                            iFlags |= SOAPY_SDR_END_BURST;
+
+                        int iWritten = SoapySDRDevice_writeStream(pSDR, pStream, (const void * const *)&pSamples, ulSamples, &iFlags, 0, 1e6);
 
                         if(iWritten < 0)
                         {
@@ -408,7 +423,7 @@ int main(int argc, char *argv[])
 
         framesync_set_callback(xFrameSync, packet_received_cb, NULL);
         framesync_set_header_soft_demod(xFrameSync, 0);
-        framesync_set_payload_soft_demod(xFrameSync, 1);
+        framesync_set_payload_soft_demod(xFrameSync, 0);
 
         if(pSDR)
         {

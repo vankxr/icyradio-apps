@@ -17,7 +17,7 @@ INCLUDEDIRSTRUCT := $(filter %/include, $(STRUCT))
 OBJECTDIRSTRUCT := $(subst $(SOURCEDIR), $(OBJECTDIR), $(SOURCEDIRSTRUCT))
 
 # Build type
-BUILD_TYPE ?= debug
+BUILD_TYPE ?= release
 
 # Compillers & Linker
 CC = gcc
