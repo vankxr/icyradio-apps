@@ -17,7 +17,7 @@
 
 uint8_t g_ubDummyMode = 0;
 uint8_t g_ubQuietMode = 0;
-volatile uint8_t g_ubStop = 0;
+volatile sig_atomic_t g_iStop = 0;
 
 uint8_t packet_received_cb(void *ptr, const framesync_stats_t *stats, const uint8_t *header, const uint8_t header_valid, const uint8_t *payload, const size_t payload_len, const uint8_t payload_valid, const uint8_t is_last)
 {
@@ -83,7 +83,7 @@ void signal_handler(int iSignal)
 {
     DBGPRINTLN_CTX("Got signal %d, stop sampling...", iSignal);
 
-    g_ubStop = 1;
+    g_iStop = 1;
 }
 
 int main(int argc, char *argv[])
@@ -116,7 +116,7 @@ int main(int argc, char *argv[])
                 DBGPRINTLN("  -h: Print this help message");
                 DBGPRINTLN("  -d: Dummy mode (generate random TX data and discard RX data)");
                 DBGPRINTLN("  -q: Quiet mode (no verbose debug output)");
-                DBGPRINTLN("  -z: No radio mode (RX outputs samples to stdout and TX reads samples from stdin)");
+                DBGPRINTLN("  -z: No radio mode (TX outputs samples to stdout and RX reads samples from stdin)");
                 DBGPRINTLN("  -t: TX mode");
                 DBGPRINTLN("  -r: RX mode (default)");
                 DBGPRINTLN("  -g <gain_dB>: RX gain (default: 0 dB) / TX attenuation (default: 10 dB)");
@@ -324,7 +324,7 @@ int main(int argc, char *argv[])
 
         float complex *pfBuffer = (float complex *)malloc(ulMTU * sizeof(float complex));
 
-        while(!g_ubStop)
+        while(!g_iStop)
         {
             (*(uint64_t *)&pubHeader[0])++; // Packet number
 
@@ -451,7 +451,7 @@ int main(int argc, char *argv[])
         if(pSDR)
             SoapySDRDevice_activateStream(pSDR, pStream, 0, 0, 0);
 
-        while(!g_ubStop)
+        while(!g_iStop)
         {
             size_t ulRead = ulMTU;
 

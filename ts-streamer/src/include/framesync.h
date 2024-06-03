@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
+#include <complex.h>
 #include <liquid/liquid.h>
 #include "framegen.h"
 
