@@ -1,0 +1,66 @@
+name: ts-streamer build
+
+on:
+  pull_request:
+    paths:
+      - "ts-streamer/**"
+    branches: [ "master" ]
+  push:
+    paths:
+      - "ts-streamer/**"
+    branches: [ "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+
+    steps:
+    - name: Update install
+      run:
+        sudo apt-get update
+      timeout-minutes: 5
+
+    - name: Install build dependencies
+      run: |
+        # Install prebuilt packages
+        sudo apt-get install build-essential cmake automake autoconf libsoapysdr-dev libfftw3-dev
+
+        # Install libfec
+        git clone https://github.com/vankxr/libfec
+        cd libfec
+        ./configure
+        make -j$(nproc)
+        sudo make install
+
+        # Install liquid-dsp
+        git clone https://github.com/vankxr/liquid-dsp
+        cd liquid-dsp
+        ./bootstrap.sh
+        ./configure
+        make -j$(nproc)
+        sudo make install
+      timeout-minutes: 5
+
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+        clean: true
+
+    - name: Build ts-streamer (${{matrix.arch}})
+      run: |
+        cd ${{github.workspace}}/ts-streamer
+        make -j$(nproc) BUILD_TYPE=release
+
+    - name: Upload results
+      uses: actions/upload-artifact@v4
+      with:
+        name: ts-streamer_${{matrix.arch}}
+        path: |
+          ${{github.workspace}}/ts-streamer/bin/icyradio*
+        retention-days: 30
