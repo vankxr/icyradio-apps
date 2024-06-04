@@ -1,62 +1,34 @@
 #include "framesync.h"
 
-
-static uint8_t framesync_step(framesync_t *fs, float complex sym, float complex *out)
+static void framesync_reconfigure(framesync_t *fs)
 {
-    float complex v;
-
-    nco_crcf_mix_down(fs->mixer, sym, &v);
-    nco_crcf_step(fs->mixer);
-
-    firpfb_crcf_push(fs->mf, v);
-    firpfb_crcf_execute(fs->mf, fs->mf_pfb_index, &v);
-
-#if FRAMESYNC_ENABLE_EQ
-    eqlms_cccf_push(fs->eq, v);
-#endif
-
-    fs->mf_counter++;
-
-    uint8_t sample_available = (fs->mf_counter >= 1) ? 1 : 0;
-
-    if(sample_available)
+    if(fs->payload_dec_len != fs->payload_dec_len_p || fs->payload_props.crc != fs->payload_props_p.crc || fs->payload_props.i_fec != fs->payload_props_p.i_fec || fs->payload_props.o_fec != fs->payload_props_p.o_fec || fs->payload_props.mod != fs->payload_props_p.mod || fs->payload_props.pilots != fs->payload_props_p.pilots)
     {
-#if FRAMESYNC_ENABLE_EQ
-        eqlms_cccf_execute(fs->eq, &v);
-#endif
-
-        *out = v;
-        fs->mf_counter -= 2;
+        fs->payload_dec = (uint8_t *)realloc(fs->payload_dec, fs->payload_dec_len * sizeof(uint8_t));
+        fs->payload_decoder = packetizer_recreate(fs->payload_decoder, fs->payload_dec_len, fs->payload_props.crc, fs->payload_props.o_fec, fs->payload_props.i_fec);
+        fs->payload_enc_len = packetizer_get_enc_msg_len(fs->payload_decoder);
+        fs->payload_enc = (uint8_t *)realloc(fs->payload_enc, fs->payload_enc_len * sizeof(uint8_t));
+        fs->payload_demod = modemcf_recreate(fs->payload_demod, fs->payload_props.mod);
+        fs->payload_mod_len = fs->payload_props.pilots ? ceilf((float)fs->payload_enc_len * 8 / (float)modem_get_bps(fs->payload_demod)) : 0;
+        fs->payload_mod = fs->payload_props.pilots ? (float complex *)realloc(fs->payload_mod, fs->payload_mod_len * sizeof(float complex)) : fs->payload_mod;
+        fs->payload_pilotsync = fs->payload_props.pilots ? qpilotsync_recreate(fs->payload_pilotsync, fs->payload_mod_len, 16) : fs->payload_pilotsync;
+        fs->payload_sym_len = fs->payload_props.pilots ? qpilotsync_get_frame_len(fs->payload_pilotsync) : ceilf((float)fs->payload_enc_len * 8 / (float)modem_get_bps(fs->payload_demod));
+        fs->payload_sym = fs->payload_props.pilots ? (float complex *)realloc(fs->payload_sym, fs->payload_sym_len * sizeof(float complex)) : fs->payload_sym;
     }
 
-    return sample_available;
+    fs->payload_props_p.crc = fs->payload_props.crc;
+    fs->payload_props_p.i_fec = fs->payload_props.i_fec;
+    fs->payload_props_p.o_fec = fs->payload_props.o_fec;
+    fs->payload_props_p.mod = fs->payload_props.mod;
+    fs->payload_props_p.pilots = fs->payload_props.pilots;
+    fs->payload_dec_len_p = fs->payload_dec_len;
 }
 static void framesync_decode_header(framesync_t *fs)
 {
-    if(fs->header_props.pilots)
-        qpilotsync_execute(fs->header_pilotsync, fs->header_sym, fs->header_mod);
-    else
-        memmove(fs->header_mod, fs->header_sym, fs->header_sym_len * sizeof(float complex));
-
-    if(fs->header_soft)
-        fs->header_valid = qpacketmodem_decode_soft(fs->header_decoder, fs->header_mod, fs->header_dec);
-    else
-        fs->header_valid = qpacketmodem_decode(fs->header_decoder, fs->header_mod, fs->header_dec);
+    fs->header_valid = packetizer_decode(fs->header_decoder, fs->header_enc, fs->header_dec);
 
     if(!fs->header_valid)
         return;
-
-    if(fs->header_props.pilots)
-    {
-        // float gamma_hat = qpilotsync_get_gain(fs->header_pilotsync);
-        float dphi_hat = qpilotsync_get_dphi(fs->header_pilotsync);
-        float phi_hat = qpilotsync_get_phi(fs->header_pilotsync);
-
-        nco_crcf_adjust_frequency(fs->mixer, dphi_hat);
-        nco_crcf_adjust_phase(fs->mixer, phi_hat + dphi_hat * fs->header_sym_len);
-
-        // firpfb_crcf_set_scale(fs->mf, 0.5f / gamma_hat);
-    }
 
     uint8_t protocol = fs->header_dec[0];
 
@@ -72,8 +44,7 @@ static void framesync_decode_header(framesync_t *fs)
     crc_scheme crc = (crc_scheme)((fs->header_dec[4] >> 5) & 0x07);
     fec_scheme i_fec  = (fec_scheme)((fs->header_dec[4]) & 0x1F);
     fec_scheme o_fec  = (fec_scheme)((fs->header_dec[5]) & 0x1F);
-    uint8_t pilots = !!(fs->header_dec[5] & 0x40);
-    uint8_t is_last = !!(fs->header_dec[5] & 0x80);
+    uint8_t pilots = !!(fs->header_dec[5] & 0x80);
 
     if(crc == LIQUID_CRC_UNKNOWN || crc >= LIQUID_CRC_NUM_SCHEMES)
     {
@@ -103,241 +74,276 @@ static void framesync_decode_header(framesync_t *fs)
         return;
     }
 
-    fs->payload_dec_len = payload_dec_len;
     fs->payload_props.mod = mod;
     fs->payload_props.crc = crc;
     fs->payload_props.i_fec = i_fec;
     fs->payload_props.o_fec = o_fec;
     fs->payload_props.pilots = pilots;
-    fs->header_is_last = is_last;
-
-    fs->payload_dec = (uint8_t *)realloc(fs->payload_dec, payload_dec_len * sizeof(uint8_t));
-
-    if(!fs->payload_dec)
-    {
-        fs->header_valid = 0;
-
-        return;
-    }
-
-    qpacketmodem_configure(fs->payload_decoder, payload_dec_len, crc, o_fec, i_fec, mod);
-
-    fs->payload_demod = modemcf_recreate(fs->payload_demod, mod);
-    fs->payload_mod_len = qpacketmodem_get_frame_len(fs->payload_decoder);
-    fs->payload_mod = (float complex *)realloc(fs->payload_mod, fs->payload_mod_len * sizeof(float complex));
-
-    if(!fs->payload_mod)
-    {
-        fs->header_valid = 0;
-
-        return;
-    }
-
-    fs->payload_pilotsync = qpilotsync_recreate(fs->payload_pilotsync, fs->payload_mod_len, 16);
-    fs->payload_sym_len = pilots ? qpilotsync_get_frame_len(fs->payload_pilotsync) : fs->payload_mod_len;
-    fs->payload_sym = (float complex *)realloc(fs->payload_sym, fs->payload_sym_len * sizeof(float complex));
-
-    if(!fs->payload_sym)
-    {
-        fs->header_valid = 0;
-
-        return;
-    }
+    fs->payload_dec_len = payload_dec_len;
 }
 
-static void framesync_process_seekpn(framesync_t *fs, float complex sym)
+static void framesync_process_seekpn(framesync_t *fs, float complex sym, unsigned int demod_sym)
 {
-    float complex *v = qdetector_cccf_execute(fs->detector, sym);
+    // Process PN sequence and try to align to it
+    fs->symbol_counter++;
 
-    if(v == NULL)
-        return;
+    size_t bps = modem_get_bps(fs->preamble_demod);
+    float len = bsequence_get_length(fs->preamble_pn);
 
-    float tau_hat = qdetector_cccf_get_tau(fs->detector);
-    float gamma_hat = qdetector_cccf_get_gamma(fs->detector);
-    float dphi_hat = qdetector_cccf_get_dphi(fs->detector);
-    float phi_hat = qdetector_cccf_get_phi(fs->detector);
+    float best_r = 0.8f; // Threshold
+    int best_i = -1;
 
-    if(tau_hat > 0)
+    for(size_t i = 0; i < 4; i++)
     {
-        fs->mf_pfb_index = (unsigned int)roundf(tau_hat * fs->mf_npfb) % fs->mf_npfb;
-        fs->mf_counter = 0;
-    }
-    else
-    {
-        fs->mf_pfb_index = (unsigned int)roundf((1.0f + tau_hat) * fs->mf_npfb) % fs->mf_npfb;
-        fs->mf_counter = 1;
-    }
+        if(i > 0)
+        {
+            sym *= cexpf(M_PI / 2.0f * _Complex_I); // Rotate 90 degrees
 
-    firpfb_crcf_set_scale(fs->mf, 0.5f / gamma_hat);
+            modemcf_demodulate(fs->preamble_demod, sym, &demod_sym); // Re-demodulate
+        }
 
-    fs->cb_stats.rssi = 20.0f * log10f(gamma_hat);
+        for(size_t j = 0; j < bps; j++)
+            bsequence_push(fs->preamble_rx[i], (demod_sym >> (bps - j - 1)) & 0x01);
 
-    nco_crcf_set_frequency(fs->mixer, dphi_hat);
-    nco_crcf_set_phase(fs->mixer, phi_hat);
+        float rxy = bsequence_correlate(fs->preamble_pn, fs->preamble_rx[i]);
+        float r = 2.0f * rxy / len - 1.0f; // > 0 if not inverted, < 0 if inverted
 
-    fs->state = FRAMESYNC_STATE_RXDELAY;
-
-    size_t buf_len = qdetector_cccf_get_buf_len(fs->detector);
-
-    framesync_process_samples(fs, v, buf_len);
-}
-static void framesync_process_rxdelay(framesync_t *fs, float complex sym)
-{
-    float complex mf_out = 0.0f;
-
-    if(!framesync_step(fs, sym, &mf_out))
-        return;
-
-#if FRAMESYNC_ENABLE_EQ
-    size_t delay = 2 * fs->mf_m + 3;
-#else
-    size_t delay = 2 * fs->mf_m;
-#endif
-
-    fs->preamble_counter++;
-
-    if(fs->preamble_counter == delay)
-    {
-        fs->preamble_counter = 0;
-        fs->state = FRAMESYNC_STATE_RXPREAMBLE;
-    }
-}
-static void framesync_process_rxpreamble(framesync_t *fs, float complex sym)
-{
-    float complex mf_out = 0.0f;
-
-    if(!framesync_step(fs, sym, &mf_out))
-        return;
-
-    fs->preamble_rx[fs->preamble_counter] = mf_out;
-
-#if FRAMESYNC_ENABLE_EQ
-    eqlms_cccf_step(fs->eq, fs->preamble_pn[fs->preamble_counter], mf_out);
-#endif
-
-    fs->preamble_counter++;
-
-    if(fs->preamble_counter == 64)
-    {
-        fs->preamble_counter = 0;
-        fs->state = FRAMESYNC_STATE_RXHEADER;
-    }
-}
-static void framesync_process_rxheader(framesync_t *fs, float complex sym)
-{
-    float complex mf_out = 0.0f;
-
-    if(!framesync_step(fs, sym, &mf_out))
-        return;
-
-    if(!fs->header_props.pilots)
-    {
-        unsigned int _sym;
-
-        modemcf_demodulate(fs->header_demod, mf_out, &_sym);
-
-        float phase_error = modemcf_get_demodulator_phase_error(fs->header_demod);
-
-        nco_crcf_pll_step(fs->mixer, phase_error);
+        if(r > best_r) // Check actual value, since we do not want to lock on an inverted phase
+        {
+            best_r = r;
+            best_i = i;
+        }
     }
 
-    fs->header_sym[fs->symbol_counter++] = mf_out;
-
-    if(fs->symbol_counter == fs->header_sym_len)
+    if(best_i < 0)
     {
-        framesync_decode_header(fs);
-
-        if(fs->header_valid)
+        if(fs->symbol_counter >= 10 * fs->preamble_sym_len)
         {
             fs->symbol_counter = 0;
-            fs->state = FRAMESYNC_STATE_RXPAYLOAD;
+
+            nco_crcf_reset(fs->mixer); // Prevent runaway NCO
         }
-        else
+
+        return;
+    }
+
+    // Adjust mixer phase to de-rotate the remaining bits
+    nco_crcf_adjust_phase(fs->mixer, M_PI / 2.0f * best_i);
+
+    // Reset counters and move on
+    fs->symbol_counter = 0;
+    fs->byte_counter = 0;
+    fs->bit_counter = 0;
+    fs->state = FRAMESYNC_STATE_HEADER;
+}
+static void framesync_process_pn(framesync_t *fs, float complex sym, unsigned int demod_sym)
+{
+    // Count the number of preamble symbols received
+    (void)sym;
+    (void)demod_sym;
+
+    fs->symbol_counter++;
+
+    if(fs->symbol_counter == fs->preamble_sym_len)
+    {
+        // Reset counters and move on
+        fs->symbol_counter = 0;
+        fs->byte_counter = 0;
+        fs->bit_counter = 0;
+        fs->state = FRAMESYNC_STATE_HEADER;
+    }
+}
+static void framesync_process_header(framesync_t *fs, float complex sym, unsigned int demod_sym)
+{
+    // Process header symbols TODO: Support soft demodulation when pilots are off
+    if(fs->header_props.pilots)
+    {
+        // Pilots are enabled, we need to store all symbols before decoding
+        fs->header_sym[fs->symbol_counter++] = sym;
+
+        if(fs->symbol_counter < fs->header_sym_len)
+            return;
+
+        // All here, decode
+        qpilotsync_execute(fs->header_pilotsync, fs->header_sym, fs->header_mod);
+
+        for(size_t i = 0; i < fs->header_mod_len; i++)
         {
-            framesync_reset(fs);
+            modemcf_demodulate(fs->header_demod, fs->header_mod[i], &demod_sym);
 
-            if(fs->cb)
+            size_t bps = modem_get_bps(fs->header_demod);
+
+            for(size_t j = 0; j < bps; j++)
             {
-                fs->cb_stats.evm = fs->header_props.pilots ? qpilotsync_get_evm(fs->header_pilotsync) : 0.0f;
-                fs->cb_stats.cfo = nco_crcf_get_frequency(fs->mixer);
+                if(!fs->bit_counter)
+                    fs->header_enc[fs->byte_counter] = 0x00;
 
-                fs->cb(fs->cb_ptr, &fs->cb_stats, fs->header_dec + 6, fs->header_valid, NULL, 0, 0, fs->header_is_last);
+                uint8_t bit = (demod_sym >> (bps - j - 1)) & 0x01;
+
+                fs->header_enc[fs->byte_counter] |= bit << (7 - fs->bit_counter++);
+
+                if(fs->bit_counter == 8)
+                {
+                    fs->bit_counter = 0;
+                    fs->byte_counter++;
+                }
             }
         }
     }
-}
-static void framesync_process_rxpayload(framesync_t *fs, float complex sym)
-{
-    float complex mf_out = 0.0f;
-
-    if(!framesync_step(fs, sym, &mf_out))
-        return;
-
-    if(!fs->payload_props.pilots)
+    else
     {
-        unsigned int _sym;
-
-        modemcf_demodulate(fs->payload_demod, mf_out, &_sym);
-
-        float phase_error = modemcf_get_demodulator_phase_error(fs->payload_demod);
-        float evm = modemcf_get_demodulator_evm(fs->payload_demod);
-
-        nco_crcf_pll_step(fs->mixer, phase_error);
+        // No pilots, we can start decoding as we receive symbols
+        float evm = modemcf_get_demodulator_evm(fs->header_demod);
 
         if(!fs->symbol_counter)
             fs->cb_stats.evm = evm * evm;
         else
             fs->cb_stats.evm += evm * evm;
+
+        size_t bps = modem_get_bps(fs->header_demod);
+
+        for(size_t i = 0; i < bps; i++)
+        {
+            if(!fs->bit_counter)
+                fs->header_enc[fs->byte_counter] = 0x00;
+
+            uint8_t bit = (demod_sym >> (bps - i - 1)) & 0x01;
+
+            fs->header_enc[fs->byte_counter] |= bit << (7 - fs->bit_counter++);
+
+            if(fs->bit_counter == 8)
+            {
+                fs->bit_counter = 0;
+                fs->byte_counter++;
+            }
+        }
+
+        fs->symbol_counter++;
     }
 
-    fs->payload_sym[fs->symbol_counter++] = mf_out;
-
-    if(fs->symbol_counter == fs->payload_sym_len)
+    if(fs->byte_counter == fs->header_enc_len)
     {
-        if(fs->payload_props.pilots)
-            qpilotsync_execute(fs->payload_pilotsync, fs->payload_sym, fs->payload_mod);
-        else
-            memmove(fs->payload_mod, fs->payload_sym, fs->payload_sym_len * sizeof(float complex));
+        framesync_decode_header(fs);
+        framesync_reconfigure(fs);
 
-        if(fs->payload_soft)
-            fs->payload_valid = qpacketmodem_decode_soft(fs->payload_decoder, fs->payload_mod, fs->payload_dec);
-        else
-            fs->payload_valid = qpacketmodem_decode(fs->payload_decoder, fs->payload_mod, fs->payload_dec);
-
-        if(fs->payload_props.pilots)
+        if(fs->header_valid)
         {
-            float gamma_hat = qpilotsync_get_gain(fs->payload_pilotsync);
-            float dphi_hat = qpilotsync_get_dphi(fs->payload_pilotsync);
-            float phi_hat = qpilotsync_get_phi(fs->payload_pilotsync);
-
-            nco_crcf_adjust_frequency(fs->mixer, dphi_hat);
-            nco_crcf_adjust_phase(fs->mixer, phi_hat + dphi_hat * fs->payload_sym_len);
-
-            // firpfb_crcf_set_scale(fs->mf, 0.5f / gamma_hat);
-        }
-
-        uint8_t force_relock = fs->header_is_last || !fs->payload_valid;
-
-        if(fs->cb)
-        {
-            fs->cb_stats.evm = fs->payload_props.pilots ? qpilotsync_get_evm(fs->payload_pilotsync) : 10.0f * log10f(fs->cb_stats.evm / (float)fs->payload_sym_len);
-            fs->cb_stats.cfo = nco_crcf_get_frequency(fs->mixer);
-
-            force_relock |= !!fs->cb(fs->cb_ptr, &fs->cb_stats, fs->header_dec + 6, fs->header_valid, fs->payload_dec, fs->payload_dec_len, fs->payload_valid, fs->header_is_last);
-        }
-
-        if(force_relock)
-        {
-            framesync_reset(fs);
-        }
-        else
-        {
-            fs->preamble_counter = 0;
+            // Reset counters and move on
             fs->symbol_counter = 0;
-            fs->state = FRAMESYNC_STATE_RXPREAMBLE;
+            fs->byte_counter = 0;
+            fs->bit_counter = 0;
+            fs->state = FRAMESYNC_STATE_PAYLOAD;
+        }
+        else
+        {
+            if(fs->cb)
+            {
+                fs->cb_stats.evm = fs->header_props.pilots ? qpilotsync_get_evm(fs->header_pilotsync) : 10.0f * log10f(fs->cb_stats.evm / (float)fs->symbol_counter);
+                fs->cb_stats.rssi = 20.0f * log10f(1.f / agc_crcf_get_gain(fs->agc));
+                fs->cb_stats.cfo = nco_crcf_get_frequency(fs->mixer);
+
+                fs->cb(fs->cb_ptr, &fs->cb_stats, fs->header_dec + 6, fs->header_valid, NULL, 0, 0);
+            }
+
+            // Reset counters and move on
+            fs->symbol_counter = 0;
+            fs->byte_counter = 0;
+            fs->bit_counter = 0;
+            fs->state = FRAMESYNC_STATE_PN_SEEK;
         }
     }
 }
+static void framesync_process_payload(framesync_t *fs, float complex sym, unsigned int demod_sym)
+{
+    // Process payload symbols TODO: Support soft demodulation when pilots are off
+    if(fs->payload_props.pilots)
+    {
+        // Pilots are enabled, we need to store all symbols before decoding
+        fs->payload_sym[fs->symbol_counter++] = sym;
+
+        if(fs->symbol_counter < fs->payload_sym_len)
+            return;
+
+        // All here, decode
+        qpilotsync_execute(fs->payload_pilotsync, fs->payload_sym, fs->payload_mod);
+
+        size_t bps = modem_get_bps(fs->payload_demod);
+
+        for(size_t i = 0; i < fs->payload_mod_len; i++)
+        {
+            modemcf_demodulate(fs->payload_demod, fs->payload_mod[i], &demod_sym);
+
+            for(size_t j = 0; j < bps; j++)
+            {
+                if(!fs->bit_counter)
+                    fs->payload_enc[fs->byte_counter] = 0x00;
+
+                uint8_t bit = (demod_sym >> (bps - j - 1)) & 0x01;
+
+                fs->payload_enc[fs->byte_counter] |= bit << (7 - fs->bit_counter++);
+
+                if(fs->bit_counter == 8)
+                {
+                    fs->bit_counter = 0;
+                    fs->byte_counter++;
+                }
+            }
+        }
+    }
+    else
+    {
+        // No pilots, we can start decoding as we receive symbols
+        float evm = modemcf_get_demodulator_evm(fs->payload_demod);
+
+        if(!fs->symbol_counter)
+            fs->cb_stats.evm = evm * evm;
+        else
+            fs->cb_stats.evm += evm * evm;
+
+        size_t bps = modem_get_bps(fs->payload_demod);
+
+        for(size_t i = 0; i < bps; i++)
+        {
+            if(!fs->bit_counter)
+                fs->payload_enc[fs->byte_counter] = 0x00;
+
+            uint8_t bit = (demod_sym >> (bps - i - 1)) & 0x01;
+
+            fs->payload_enc[fs->byte_counter] |= bit << (7 - fs->bit_counter++);
+
+            if(fs->bit_counter == 8)
+            {
+                fs->bit_counter = 0;
+                fs->byte_counter++;
+            }
+        }
+
+        fs->symbol_counter++;
+    }
+
+    if(fs->byte_counter == fs->payload_enc_len)
+    {
+        fs->payload_valid = packetizer_decode(fs->payload_decoder, fs->payload_enc, fs->payload_dec);
+
+        uint8_t force_relock = !fs->payload_valid;
+
+        if(fs->cb)
+        {
+            fs->cb_stats.evm = fs->payload_props.pilots ? qpilotsync_get_evm(fs->payload_pilotsync) : 10.0f * log10f(fs->cb_stats.evm / (float)fs->symbol_counter);
+            fs->cb_stats.rssi = 20.0f * log10f(1.f / agc_crcf_get_gain(fs->agc));
+            fs->cb_stats.cfo = nco_crcf_get_frequency(fs->mixer);
+
+            force_relock |= !!fs->cb(fs->cb_ptr, &fs->cb_stats, fs->header_dec + 6, fs->header_valid, fs->payload_dec, fs->payload_dec_len, fs->payload_valid);
+        }
+
+        // Reset counters and move on
+        fs->symbol_counter = 0;
+        fs->byte_counter = 0;
+        fs->bit_counter = 0;
+        fs->state = force_relock ? FRAMESYNC_STATE_PN_SEEK : FRAMESYNC_STATE_PN_RX_DELAY;
+    }
+}
+
 
 framesync_t *framesync_create(framegenprops_t *h_props, size_t h_len)
 {
@@ -361,118 +367,89 @@ framesync_t *framesync_create(framegenprops_t *h_props, size_t h_len)
     if(!fs)
         return NULL;
 
+    // callback
     fs->cb = NULL;
     fs->cb_ptr = NULL;
 
-    fs->preamble_pn = (float complex *)malloc(64 * sizeof(float complex));
+    // carrier, timing recovery and eq objects
+    float bw = 0.9f;
 
-    if(!fs->preamble_pn)
-    {
-        free(fs);
-
-        return NULL;
-    }
-
-    msequence ms = msequence_create_default(7);
-
-    for(size_t i = 0; i < 64; i++)
-    {
-        fs->preamble_pn[i] = (msequence_advance(ms) ? M_SQRT1_2 : -M_SQRT1_2);
-        fs->preamble_pn[i] += (msequence_advance(ms) ? M_SQRT1_2 : -M_SQRT1_2) * _Complex_I;
-    }
-
-    msequence_destroy(ms);
-
-    fs->preamble_rx = (float complex *)malloc(64 * sizeof(float complex));
-
-    if(!fs->preamble_rx)
-    {
-        free(fs->preamble_pn);
-        free(fs);
-
-        return NULL;
-    }
-
-    fs->detector_k = 2;
-    fs->detector_m = 7;
-    fs->detector_beta = 0.3f;
-    fs->detector = qdetector_cccf_create_linear(fs->preamble_pn, 64, LIQUID_FIRFILT_RRC, fs->detector_k, fs->detector_m, fs->detector_beta);
-
-    qdetector_cccf_set_threshold(fs->detector, 0.6f);
-    qdetector_cccf_set_range(fs->detector, 0.05f);
-
-    fs->mf_k = 2;
-    fs->mf_m = 7;
-    fs->mf_beta = 0.25f;
-    fs->mf_npfb = 64;
-    fs->mf = firpfb_crcf_create_rnyquist(LIQUID_FIRFILT_RRC, fs->mf_npfb, fs->mf_k, fs->mf_m, fs->mf_beta);
+    fs->agc = agc_crcf_create();
+    agc_crcf_set_bandwidth(fs->agc, 0.02f * bw);
 
     fs->mixer = nco_crcf_create(LIQUID_NCO);
-    nco_crcf_pll_set_bandwidth(fs->mixer, 1e-4f);
+    nco_crcf_pll_set_bandwidth(fs->mixer, 0.001f * bw);
 
-#if FRAMESYNC_ENABLE_EQ
-    fs->eq = eqlms_cccf_create_lowpass(2 * fs->mf_k * 3 + 1, 0.4f);
+    fs->symsync = symsync_crcf_create_rnyquist(LIQUID_FIRFILT_RRC, 2, 15, 0.2f, 32);
+    symsync_crcf_set_lf_bw(fs->symsync, 0.001f * bw);
+    symsync_crcf_set_output_rate(fs->symsync, 2);
+    fs->symsync_n = 0;
 
-    eqlms_cccf_set_bw(fs->eq, 0.05f);
-#endif
+    fs->eq = eqlms_cccf_create_lowpass(2 * 4 + 1, 0.45f);
+    eqlms_cccf_set_bw(fs->eq, 0.02f * bw);
+    fs->eq_strat = FRAMESYNC_EQ_STRAT_OFF;
 
+    // preamble
+    msequence pn_seq = msequence_create_default(6);
+
+    fs->preamble_demod = modemcf_create(LIQUID_MODEM_QPSK); // Check the generator for more info
+
+    fs->preamble_sym_len = ceilf((float)msequence_get_length(pn_seq) / (float)modem_get_bps(fs->preamble_demod));
+    size_t pn_len = fs->preamble_sym_len * modem_get_bps(fs->preamble_demod);
+
+    fs->preamble_pn = bsequence_create(pn_len);
+
+    for(size_t i = 0; i < pn_len; i++)
+        bsequence_push(fs->preamble_pn, msequence_advance(pn_seq));
+
+    msequence_destroy(pn_seq);
+
+    for(size_t i = 0; i < 4; i++)
+        fs->preamble_rx[i] = bsequence_create(pn_len);
+
+    // header
     memmove(&fs->header_props, h_props, sizeof(framegenprops_t));
 
     fs->header_user_len = h_len;
     fs->header_dec_len = 6 + h_len;
     fs->header_dec = (uint8_t *)malloc(fs->header_dec_len);
-
-    if(!fs->header_dec)
-    {
-        free(fs->preamble_rx);
-        free(fs->preamble_pn);
-        free(fs);
-
-        return NULL;
-    }
-
-    fs->header_decoder = qpacketmodem_create();
-
-    qpacketmodem_configure(fs->header_decoder, fs->header_dec_len, fs->header_props.crc, fs->header_props.o_fec, fs->header_props.i_fec, fs->header_props.mod);
-
+    fs->header_decoder = packetizer_create(fs->header_dec_len, fs->header_props.crc, fs->header_props.o_fec, fs->header_props.i_fec);
+    fs->header_enc_len = packetizer_get_enc_msg_len(fs->header_decoder);
+    fs->header_enc = (uint8_t *)malloc(fs->header_enc_len);
     fs->header_demod = modemcf_create(fs->header_props.mod);
-    fs->header_mod_len = qpacketmodem_get_frame_len(fs->header_decoder);
-    fs->header_mod = (float complex *)malloc(fs->header_mod_len * sizeof(float complex));
+    fs->header_mod_len = fs->header_props.pilots ? ceilf((float)fs->header_enc_len * 8 / (float)modem_get_bps(fs->header_demod)) : 0;
+    fs->header_mod = fs->header_props.pilots ? (float complex *)malloc(fs->header_mod_len * sizeof(float complex)) : NULL;
+    fs->header_pilotsync = fs->header_props.pilots ? qpilotsync_create(fs->header_mod_len, 16) : NULL;
+    fs->header_sym_len = fs->header_props.pilots ? qpilotsync_get_frame_len(fs->header_pilotsync) : ceilf((float)fs->header_enc_len * 8 / (float)modem_get_bps(fs->header_demod));
+    fs->header_sym = fs->header_props.pilots ? (float complex *)malloc(fs->header_sym_len * sizeof(float complex)) : NULL;
+    fs->header_soft = 0;
+    fs->header_valid = 0;
 
-    if(!fs->header_mod)
-    {
-        free(fs->header_dec);
-        free(fs->preamble_rx);
-        free(fs->preamble_pn);
-        free(fs);
-
-        return NULL;
-    }
-
-    fs->header_pilotsync = qpilotsync_create(fs->header_mod_len, 16);
-    fs->header_sym_len = fs->header_props.pilots ? qpilotsync_get_frame_len(fs->header_pilotsync) : fs->header_mod_len;
-    fs->header_sym = (float complex *)malloc(fs->header_sym_len * sizeof(float complex));
-
-    if(!fs->header_sym)
-    {
-        free(fs->header_mod);
-        free(fs->header_dec);
-        free(fs->preamble_rx);
-        free(fs->preamble_pn);
-        free(fs);
-
-        return NULL;
-    }
-
+    // payload
+    fs->payload_props_p.crc = LIQUID_CRC_NONE;
+    fs->payload_props_p.i_fec = LIQUID_FEC_NONE;
+    fs->payload_props_p.o_fec = LIQUID_FEC_NONE;
+    fs->payload_props_p.mod = LIQUID_MODEM_QPSK;
+    fs->payload_props_p.pilots = 0;
+    fs->payload_props.crc = LIQUID_CRC_NONE;
+    fs->payload_props.i_fec = LIQUID_FEC_NONE;
+    fs->payload_props.o_fec = LIQUID_FEC_NONE;
+    fs->payload_props.mod = LIQUID_MODEM_QPSK;
+    fs->payload_props.pilots = 0;
+    fs->payload_dec_len_p = 0;
     fs->payload_dec_len = 0;
     fs->payload_dec = NULL;
-    fs->payload_decoder = qpacketmodem_create();
-    fs->payload_demod = modemcf_create(LIQUID_MODEM_QPSK); // dummy modem, will be reconfigured later
+    fs->payload_decoder = packetizer_create(1, LIQUID_CRC_NONE, LIQUID_FEC_NONE, LIQUID_FEC_NONE);
+    fs->payload_enc_len = 0;
+    fs->payload_enc = NULL;
+    fs->payload_demod = modemcf_create(LIQUID_MODEM_QPSK);
     fs->payload_mod_len = 0;
     fs->payload_mod = NULL;
     fs->payload_pilotsync = qpilotsync_create(128, 64);
     fs->payload_sym_len = 0;
     fs->payload_sym = NULL;
+    fs->payload_soft = 0;
+    fs->payload_valid = 0;
 
     framesync_reset(fs);
 
@@ -483,26 +460,53 @@ void framesync_delete(framesync_t *fs)
     if(!fs)
         return;
 
-    qpilotsync_destroy(fs->payload_pilotsync);
-    modemcf_destroy(fs->payload_demod);
-    qpacketmodem_destroy(fs->payload_decoder);
-    qpilotsync_destroy(fs->header_pilotsync);
-    modemcf_destroy(fs->header_demod);
-    qpacketmodem_destroy(fs->header_decoder);
-#if FRAMESYNC_ENABLE_EQ
-    eqlms_cccf_destroy(fs->eq);
-#endif
-    nco_crcf_destroy(fs->mixer);
-    firpfb_crcf_destroy(fs->mf);
-    qdetector_cccf_destroy(fs->detector);
+    // payload
+    if(fs->payload_sym)
+        free(fs->payload_sym);
 
-    free(fs->payload_sym);
-    free(fs->payload_dec);
-    free(fs->header_sym);
-    free(fs->header_mod);
+    qpilotsync_destroy(fs->payload_pilotsync);
+
+    if(fs->payload_mod)
+        free(fs->payload_mod);
+
+    modemcf_destroy(fs->payload_demod);
+
+    if(fs->payload_enc)
+        free(fs->payload_enc);
+
+    packetizer_destroy(fs->payload_decoder);
+
+    if(fs->payload_dec)
+        free(fs->payload_dec);
+
+    // header
+    if(fs->header_sym)
+        free(fs->header_sym);
+
+    if(fs->header_pilotsync)
+        qpilotsync_destroy(fs->header_pilotsync);
+
+    if(fs->header_mod)
+        free(fs->header_mod);
+
+    modemcf_destroy(fs->header_demod);
+    free(fs->header_enc);
+    packetizer_destroy(fs->header_decoder);
     free(fs->header_dec);
-    free(fs->preamble_rx);
-    free(fs->preamble_pn);
+
+    // preamble
+    for(size_t i = 0; i < 4; i++)
+        bsequence_destroy(fs->preamble_rx[i]);
+
+    bsequence_destroy(fs->preamble_pn);
+    modemcf_destroy(fs->preamble_demod);
+
+    // carrier, timing recovery and eq objects
+    eqlms_cccf_destroy(fs->eq);
+    symsync_crcf_destroy(fs->symsync);
+    nco_crcf_destroy(fs->mixer);
+    agc_crcf_destroy(fs->agc);
+
     free(fs);
 }
 void framesync_reset(framesync_t *fs)
@@ -510,16 +514,28 @@ void framesync_reset(framesync_t *fs)
     if(!fs)
         return;
 
-    qdetector_cccf_reset(fs->detector);
-    firpfb_crcf_reset(fs->mf);
+    agc_crcf_reset(fs->agc);
     nco_crcf_reset(fs->mixer);
-#if FRAMESYNC_ENABLE_EQ
+    symsync_crcf_reset(fs->symsync);
     eqlms_cccf_reset(fs->eq);
-#endif
+    modemcf_reset(fs->preamble_demod);
 
-    fs->preamble_counter = 0;
+    for(size_t i = 0; i < 4; i++)
+        bsequence_reset(fs->preamble_rx[i]);
+
+    modemcf_reset(fs->header_demod);
+
+    if(fs->header_pilotsync)
+        qpilotsync_reset(fs->header_pilotsync);
+
+    modemcf_reset(fs->payload_demod);
+    qpilotsync_reset(fs->payload_pilotsync);
+
+    fs->symsync_n = 0;
     fs->symbol_counter = 0;
-    fs->state = FRAMESYNC_STATE_DETECTFRAME;
+    fs->byte_counter = 0;
+    fs->bit_counter = 0;
+    fs->state = FRAMESYNC_STATE_PN_SEEK;
 }
 void framesync_set_callback(framesync_t *fs, framesync_packet_received_cb_t cb, void *cb_ptr)
 {
@@ -564,6 +580,30 @@ void framesync_set_payload_soft_demod(framesync_t *fs, uint8_t soft)
 
     fs->payload_soft = !!soft;
 }
+uint8_t framesync_get_eq_strategy(framesync_t *fs)
+{
+    if(!fs)
+        return FRAMESYNC_EQ_STRAT_OFF;
+
+    return fs->eq_strat;
+}
+void framesync_set_eq_strategy(framesync_t *fs, uint8_t strategy)
+{
+    if(!fs)
+        return;
+
+    switch(strategy)
+    {
+        case FRAMESYNC_EQ_STRAT_OFF:
+        case FRAMESYNC_EQ_STRAT_CONST_MOD:
+        case FRAMESYNC_EQ_STRAT_DEC_DIR:
+        break;
+        default:
+            return;
+    }
+
+    fs->eq_strat = strategy;
+}
 void framesync_process_samples(framesync_t *fs, float complex *buffer, size_t buffer_len)
 {
     if(!fs || !buffer || !buffer_len)
@@ -571,23 +611,94 @@ void framesync_process_samples(framesync_t *fs, float complex *buffer, size_t bu
 
     for(size_t i = 0; i < buffer_len; i++)
     {
-        switch(fs->state)
+        float complex sym[8];
+        unsigned int n = 0;
+
+        agc_crcf_execute(fs->agc, buffer[i], &sym[0]);
+
+        symsync_crcf_execute(fs->symsync, sym, 1, sym, &n);
+
+        for(size_t j = 0; j < n; j++)
         {
-            case FRAMESYNC_STATE_DETECTFRAME:
-                framesync_process_seekpn(fs, buffer[i]);
-            break;
-            case FRAMESYNC_STATE_RXDELAY:
-                framesync_process_rxdelay(fs, buffer[i]);
-            break;
-            case FRAMESYNC_STATE_RXPREAMBLE:
-                framesync_process_rxpreamble(fs, buffer[i]);
-            break;
-            case FRAMESYNC_STATE_RXHEADER:
-                framesync_process_rxheader(fs, buffer[i]);
-            break;
-            case FRAMESYNC_STATE_RXPAYLOAD:
-                framesync_process_rxpayload(fs, buffer[i]);
-            break;
+            float complex _sym = sym[j];
+
+            nco_crcf_step(fs->mixer);
+            nco_crcf_mix_down(fs->mixer, _sym, &_sym);
+
+            eqlms_cccf_push(fs->eq, _sym);
+
+            fs->symsync_n++;
+            if(!(fs->symsync_n & 1))
+                continue;
+
+            eqlms_cccf_execute(fs->eq, &_sym);
+
+            // Select appropriate modem given the current state
+            modemcf dem = NULL;
+
+            switch(fs->state)
+            {
+                case FRAMESYNC_STATE_PN_SEEK:
+                case FRAMESYNC_STATE_PN_RX_DELAY:
+                    dem = fs->preamble_demod;
+                break;
+                case FRAMESYNC_STATE_HEADER:
+                    dem = fs->header_demod;
+                break;
+                case FRAMESYNC_STATE_PAYLOAD:
+                    dem = fs->payload_demod;
+                break;
+            }
+
+            //demodulate and get phase error
+            unsigned int demod_sym = 0;
+            float phi_hat = 0.0f;
+
+            if(dem)
+            {
+                modemcf_demodulate(dem, _sym, &demod_sym);
+                phi_hat = modemcf_get_demodulator_phase_error(dem);
+            }
+
+            nco_crcf_pll_step(fs->mixer, phi_hat);
+
+            if(fs->eq_strat != FRAMESYNC_EQ_STRAT_OFF) // TODO Support Equalizer, after first PN alignment
+            {
+                float complex _d = 0.0f;
+
+                switch(fs->eq_strat)
+                {
+                    case FRAMESYNC_EQ_STRAT_CONST_MOD:
+                    {
+                        _d = _sym / cabsf(_sym);
+                    }
+                    break;
+                    case FRAMESYNC_EQ_STRAT_DEC_DIR:
+                    {
+                        if(dem)
+                            modemcf_get_demodulator_sample(dem, &_d);
+                    }
+                    break;
+                }
+
+                eqlms_cccf_step(fs->eq, _d, _sym);
+            }
+
+            switch(fs->state)
+            {
+                case FRAMESYNC_STATE_PN_SEEK:
+                    framesync_process_seekpn(fs, _sym, demod_sym);
+                break;
+                case FRAMESYNC_STATE_PN_RX_DELAY:
+                    framesync_process_pn(fs, _sym, demod_sym);
+                break;
+                case FRAMESYNC_STATE_HEADER:
+                    framesync_process_header(fs, _sym, demod_sym);
+                break;
+                case FRAMESYNC_STATE_PAYLOAD:
+                    framesync_process_payload(fs, _sym, demod_sym);
+                break;
+            }
         }
     }
 }

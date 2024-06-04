@@ -8,19 +8,21 @@
 #include <liquid/liquid.h>
 #include "framegen.h"
 
-#define FRAMESYNC_ENABLE_EQ 0
-
 // Synchronizer states
-#define FRAMESYNC_STATE_DETECTFRAME 0
-#define FRAMESYNC_STATE_RXDELAY 1
-#define FRAMESYNC_STATE_RXPREAMBLE 2
-#define FRAMESYNC_STATE_RXHEADER 3
-#define FRAMESYNC_STATE_RXPAYLOAD 4
+#define FRAMESYNC_STATE_PN_SEEK     0   // preamble search and align
+#define FRAMESYNC_STATE_PN_RX_DELAY 1   // preamble rx delay
+#define FRAMESYNC_STATE_HEADER      2   // header reception
+#define FRAMESYNC_STATE_PAYLOAD     3   // payload reception
+
+// Equalizer strategies
+#define FRAMESYNC_EQ_STRAT_OFF          0   // equalizer disabled
+#define FRAMESYNC_EQ_STRAT_CONST_MOD    1   // constant modulus
+#define FRAMESYNC_EQ_STRAT_DEC_DIR      2   // decision-directed
 
 typedef struct framesync_stats_t framesync_stats_t;
 typedef struct framesync_t framesync_t;
 
-typedef uint8_t (* framesync_packet_received_cb_t)(void *, const framesync_stats_t *, const uint8_t *, const uint8_t, const uint8_t *, const size_t, const uint8_t, const uint8_t);
+typedef uint8_t (* framesync_packet_received_cb_t)(void *, const framesync_stats_t *, const uint8_t *, const uint8_t, const uint8_t *, const size_t, const uint8_t);
 
 struct framesync_stats_t
 {
@@ -31,68 +33,63 @@ struct framesync_stats_t
 struct framesync_t
 {
     // callback
-    framesync_packet_received_cb_t cb;         // user-defined callback function
-    void *                         cb_ptr;     // userdata pointer passed to callback
-    framesync_stats_t              cb_stats;   // frame statistic object (synchronizer)
+    framesync_packet_received_cb_t cb;                 // user-defined callback function
+    void *                         cb_ptr;             // userdata pointer passed to callback
+    framesync_stats_t              cb_stats;           // frame statistic object (synchronizer)
+
+    // carrier, timing recovery and eq objects
+    agc_crcf                       agc;                // automatic gain control
+    nco_crcf                       mixer;              // carrier frequency recovery
+    symsync_crcf                   symsync;            // symbol synchronizer
+    size_t                         symsync_n;          // symbol synchronizer decimation counter
+    eqlms_cccf                     eq;                 // equalizer
+    uint8_t                        eq_strat;           // equalizer strategy
 
     // preamble
-    float complex *                preamble_pn;        // known 64-symbol p/n sequence
-    float complex *                preamble_rx;        // received p/n symbols
-
-    // frame detector objects
-    unsigned int                   detector_k;         // filter samples/symbol (fixed at 2)
-    unsigned int                   detector_m;         // filter delay (symbols)
-    float                          detector_beta;      // filter excess bandwidth factor
-    qdetector_cccf                 detector;           // pre-demod detector
-
-    // timing recovery objects, states
-    unsigned int                   mf_k;               // matched filter samples/symbol (fixed at 2)
-    unsigned int                   mf_m;               // matched filter delay (symbols)
-    float                          mf_beta;            // excess bandwidth factor
-    unsigned int                   mf_npfb;            // number of filters in symsync
-    firpfb_crcf                    mf;                 // matched filter decimator
-    int                            mf_counter;         // matched filter output timer
-    unsigned int                   mf_pfb_index;       // filterbank index
-
-    // carrier recovery and equalization
-    nco_crcf                       mixer;              // carrier frequency recovery
-#if FRAMESYNC_ENABLE_EQ
-    eqlms_cccf                     eq;          // equalizer (trained on p/n sequence)
-#endif
+    modemcf                        preamble_demod;     // preamble demodulator
+    size_t                         preamble_sym_len;   // preamble length (symbols)
+    bsequence                      preamble_pn;        // known p/n sequence
+    bsequence                      preamble_rx[4];     // received p/n sequence (one for each quadrant)
 
     // header
     framegenprops_t                header_props;       // header properties
-    size_t                         header_user_len;    // length of user-defined array
-    size_t                         header_dec_len;     // length of header (decoded)
-    uint8_t *                      header_dec;         // header bytes (decoded)
-    qpacketmodem                   header_decoder;     // header demodulator/decoder
-    modemcf                        header_demod;       // header demod (for phase recovery only)
-    size_t                         header_mod_len;     // header symbols (length)
-    float complex *                header_mod;         // header symbols (received)
-    qpilotsync                     header_pilotsync;   // header demodulator/decoder
-    size_t                         header_sym_len;     // header symbols with pilots (length)
-    float complex *                header_sym;         // header symbols with pilots (received)
+    size_t                         header_user_len;    // header user section length
+    size_t                         header_dec_len;     // header length (decoded)
+    uint8_t *                      header_dec;         // header data (decoded)
+    packetizer                     header_decoder;     // header decoder
+    size_t                         header_enc_len;     // header length (encoded)
+    uint8_t *                      header_enc;         // header bytes (encoded)
+    modemcf                        header_demod;       // header demod
+    size_t                         header_mod_len;     // header length (symbols)
+    float complex *                header_mod;         // header symbols
+    qpilotsync                     header_pilotsync;   // header pilot synchronizer
+    size_t                         header_sym_len;     // header length with pilots (symbols)
+    float complex *                header_sym;         // header symbols with pilots
     uint8_t                        header_soft;        // header performs soft demod (0 : hard, 1 : soft)
     uint8_t                        header_valid;       // Is the header valid?
-    uint8_t                        header_is_last;     // Is this the last frame?
 
     // payload
+    framegenprops_t                payload_props_p;    // payload properties (previous frame)
     framegenprops_t                payload_props;      // payload properties
-    size_t                         payload_dec_len;    // length of payload (decoded)
+    size_t                         payload_dec_len_p;  // payload length (decoded) (previous frame)
+    size_t                         payload_dec_len;    // payload length (decoded)
     uint8_t *                      payload_dec;        // payload bytes (decoded)
-    qpacketmodem                   payload_decoder;    // payload demodulator/decoder
-    modemcf                        payload_demod;      // payload demod (for phase recovery only)
-    size_t                         payload_mod_len;    // payload symbols (length)
-    float complex *                payload_mod;        // payload symbols (received)
-    qpilotsync                     payload_pilotsync;  // payload demodulator/decoder
-    size_t                         payload_sym_len;    // payload symbols (length)
-    float complex *                payload_sym;        // payload symbols (received)
+    packetizer                     payload_decoder;    // payload decoder
+    size_t                         payload_enc_len;    // payload length (encoded)
+    uint8_t *                      payload_enc;        // payload bytes (encoded)
+    modemcf                        payload_demod;      // payload demod
+    size_t                         payload_mod_len;    // payload length (symbols)
+    float complex *                payload_mod;        // payload symbols
+    qpilotsync                     payload_pilotsync;  // payload pilot synchronizer
+    size_t                         payload_sym_len;    // payload length with pilots (symbols)
+    float complex *                payload_sym;        // payload symbols with pilots
     uint8_t                        payload_soft;       // payload performs soft demod (0 : hard, 1 : soft)
     uint8_t                        payload_valid;      // Is the payload valid?
 
     // status variables
-    size_t                         preamble_counter;   // counter: num of p/n syms received
     size_t                         symbol_counter;     // counter: num of symbols received
+    size_t                         byte_counter;       // counter: num of bytes received
+    size_t                         bit_counter;        // counter: num of bits received
     uint8_t                        state;              // receiver state
 };
 
@@ -105,6 +102,8 @@ uint8_t framesync_get_header_soft_demod(framesync_t *fs);
 void framesync_set_header_soft_demod(framesync_t *fs, uint8_t soft);
 uint8_t framesync_get_payload_soft_demod(framesync_t *fs);
 void framesync_set_payload_soft_demod(framesync_t *fs, uint8_t soft);
+uint8_t framesync_get_eq_strategy(framesync_t *fs);
+void framesync_set_eq_strategy(framesync_t *fs, uint8_t strategy);
 void framesync_process_samples(framesync_t *fs, float complex *buffer, size_t buffer_len);
 
 #endif

@@ -8,10 +8,9 @@
 #include <liquid/liquid.h>
 
 // Generator states
-#define FRAMEGEN_STATE_PREAMBLE 0
-#define FRAMEGEN_STATE_HEADER 1
-#define FRAMEGEN_STATE_PAYLOAD 2
-#define FRAMEGEN_STATE_TAIL 3
+#define FRAMEGEN_STATE_PREAMBLE 0   // preamble generation
+#define FRAMEGEN_STATE_HEADER   1   // header generation
+#define FRAMEGEN_STATE_PAYLOAD  2   // payload generation
 
 typedef struct framegenprops_t framegenprops_t;
 typedef struct framegen_t framegen_t;
@@ -28,13 +27,12 @@ struct framegen_t
 {
     // interpolator
     unsigned int    interp_k;           // interp samples/symbol (fixed at 2)
-    unsigned int    interp_m;           // interp filter delay (symbols)
-    float           interp_beta;        // excess bandwidth factor
     firinterp_crcf  interp;             // interpolator object
     float complex * interp_buf;         // output interpolator buffer
 
     // preamble
     float complex * preamble_pn;        // p/n sequence
+    size_t          preamble_pn_len;    // p/n sequence length
 
     // header
     framegenprops_t header_props;       // header properties
@@ -49,7 +47,9 @@ struct framegen_t
     float complex * header_sym;         // header symbols (pilots added)
 
     // payload
+    framegenprops_t payload_props_p;    // payload properties (previous frame)
     framegenprops_t payload_props;      // payload properties
+    size_t          payload_dec_len_p;  // payload length (decoded) (previous frame)
     size_t          payload_dec_len;    // payload length (decoded)
     qpacketmodem    payload_encoder;    // payload encoder/modulator
     size_t          payload_mod_len;    // payload length (encoded/modulated)
@@ -61,7 +61,6 @@ struct framegen_t
     // counters/states
     size_t          symbol_counter;     // output symbol number
     size_t          sample_counter;     // output sample number
-    uint8_t         is_last;            // whether this is the last frame or not (send tail symbols or not)
     uint8_t         frame_assembled;    // frame assembled flag
     uint8_t         frame_complete;     // frame completed flag
     uint8_t         state;              // generator state
@@ -75,7 +74,7 @@ void framegen_get_header_props(framegen_t *fg, framegenprops_t *props);
 void framegen_get_payload_props(framegen_t *fg, framegenprops_t *props);
 void framegen_set_payload_props(framegen_t *fg, framegenprops_t *props);
 size_t framegen_get_symbol_count(framegen_t *fg);
-void framegen_assemble(framegen_t *fg, uint8_t *header_user, uint8_t *payload, size_t payload_len, uint8_t is_last);
+void framegen_assemble(framegen_t *fg, uint8_t *header_user, uint8_t *payload, size_t payload_len);
 size_t framegen_write_samples(framegen_t *fg, float complex *buffer, size_t buffer_len);
 
 #endif

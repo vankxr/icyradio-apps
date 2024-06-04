@@ -19,12 +19,12 @@ uint8_t g_ubDummyMode = 0;
 uint8_t g_ubQuietMode = 0;
 volatile sig_atomic_t g_iStop = 0;
 
-uint8_t packet_received_cb(void *ptr, const framesync_stats_t *stats, const uint8_t *header, const uint8_t header_valid, const uint8_t *payload, const size_t payload_len, const uint8_t payload_valid, const uint8_t is_last)
+uint8_t packet_received_cb(void *ptr, const framesync_stats_t *stats, const uint8_t *header, const uint8_t header_valid, const uint8_t *payload, const size_t payload_len, const uint8_t payload_valid)
 {
     if(!header_valid)
         return 1;
 
-    // DBGPRINTLN_CTX("Packet received (H %s%s, P: (%lu bytes, %s], RSSI: %.2f dB, EVM: %.2f dB, CFO %.2f %%Fs)", header_valid ? "OK" : "FAIL", is_last ? " [LAST]" : "", payload_len, payload_valid ? "OK" : "FAIL", stats->rssi, stats->evm, stats->cfo * 100);
+    // DBGPRINTLN_CTX("Packet received (H %s, P: (%lu bytes, %s], RSSI: %.2f dB, EVM: %.2f dB, CFO %.2f %%Fs)", header_valid ? "OK" : "FAIL", payload_len, payload_valid ? "OK" : "FAIL", stats->rssi, stats->evm, stats->cfo * 100);
 
     static uint64_t ullTotalPackets = 0;
     static uint64_t ullTotalFailedPackets = 0;
@@ -51,7 +51,7 @@ uint8_t packet_received_cb(void *ptr, const framesync_stats_t *stats, const uint
 
     if(!g_ubQuietMode)
     {
-        DBGPRINTLN_CTX("Packet %lu received (H %s%s, P: [%lu bytes, %s], RSSI: %.2f dB, EVM: %.2f dB, CFO %.2f %%Fs)", ullPacket, header_valid ? "OK" : "FAIL", is_last ? " [LAST]" : "", payload_len, payload_valid ? "OK" : "FAIL", stats->rssi, stats->evm, stats->cfo * 100);
+        DBGPRINTLN_CTX("Packet %lu received (H %s, P: [%lu bytes, %s], RSSI: %.2f dB, EVM: %.2f dB, CFO %.2f %%Fs)", ullPacket, header_valid ? "OK" : "FAIL", payload_len, payload_valid ? "OK" : "FAIL", stats->rssi, stats->evm, stats->cfo * 100);
 
         // DBGPRINT_CTX("  Header: ");
         // for(int i = 0; i < 14; i++)
@@ -236,8 +236,8 @@ int main(int argc, char *argv[])
     framegenprops_t xFramePayloadProps = {
         .crc = LIQUID_CRC_8,
         .i_fec = LIQUID_FEC_CONV_V27P78,
-        .o_fec = LIQUID_FEC_RS_M8_K239_CCSDS,
-        .mod = LIQUID_MODEM_QPSK,
+        .o_fec = LIQUID_FEC_RS_M8_DVB,
+        .mod = LIQUID_MODEM_QAM16,
         .pilots = 0,
     };
 
@@ -273,7 +273,7 @@ int main(int argc, char *argv[])
             // Assembly dummy packet to get the total number of symbols
             size_t ulPacketDataSymbols = ulCodedHeaderSymbols + ulCodedPayloadSymbols;
 
-            framegen_assemble(xFrameGen, pubHeader, pubPayload, TS_PACKET_LEN * ulNumTSFramesPerPacket, 0);
+            framegen_assemble(xFrameGen, pubHeader, pubPayload, TS_PACKET_LEN * ulNumTSFramesPerPacket);
 
             size_t ulPacketSymbols = framegen_get_symbol_count(xFrameGen) / ulInterpolation;
 
@@ -353,7 +353,7 @@ int main(int argc, char *argv[])
             }
 
             clock_t begin = clock();
-            framegen_assemble(xFrameGen, pubHeader, pubPayload, TS_PACKET_LEN * ulNumTSFramesPerPacket, 0);
+            framegen_assemble(xFrameGen, pubHeader, pubPayload, TS_PACKET_LEN * ulNumTSFramesPerPacket);
             clock_t end = clock();
 
             size_t ulSamplesLeft = framegen_get_symbol_count(xFrameGen);

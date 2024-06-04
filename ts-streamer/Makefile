@@ -31,8 +31,8 @@ GDB = gdb
 
 # Compillers & Linker flags
 ASFLAGS =
-CFLAGS = $(addprefix -I,$(INCLUDEDIRSTRUCT)) -std=gnu17 -O3 -W
-CXXFLAGS = $(addprefix -I,$(INCLUDEDIRSTRUCT)) -std=gnu17 -O3 -W
+CFLAGS = $(addprefix -I,$(INCLUDEDIRSTRUCT)) -std=gnu17 -O3 -W -Wno-deprecated-declarations
+CXXFLAGS = $(addprefix -I,$(INCLUDEDIRSTRUCT)) -std=gnu17 -O3 -W -Wno-deprecated-declarations
 LDFLAGS =
 LDLIBS = -lc -lm -lliquid -lSoapySDR -pthread
 
