@@ -24,6 +24,9 @@ uint8_t packet_received_cb(void *ptr, const framesync_stats_t *stats, const uint
     if(!header_valid)
         return 1;
 
+    if(g_iStop)
+        return 0;
+
     // DBGPRINTLN_CTX("Packet received (H %s, P: (%lu bytes, %s], RSSI: %.2f dB, EVM: %.2f dB, CFO %.2f %%Fs)", header_valid ? "OK" : "FAIL", payload_len, payload_valid ? "OK" : "FAIL", stats->rssi, stats->evm, stats->cfo * 100);
 
     static uint64_t ullTotalPackets = 0;
@@ -81,7 +84,8 @@ uint8_t packet_received_cb(void *ptr, const framesync_stats_t *stats, const uint
 }
 void signal_handler(int iSignal)
 {
-    DBGPRINTLN_CTX("Got signal %d, stop sampling...", iSignal);
+    if(iSignal == SIGINT)
+        DBGPRINTLN_CTX("Kayboard interrupt, stopping...");
 
     g_iStop = 1;
 }
@@ -93,7 +97,6 @@ int main(int argc, char *argv[])
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
-    DBGPRINTLN_CTX("Set SIGINT handler...");
     signal(SIGINT, signal_handler);
 
     // Parse arguments
@@ -352,9 +355,15 @@ int main(int argc, char *argv[])
                     pubPayload[i] = rand() % 256;
             }
 
+            if(g_iStop)
+                break;
+
             clock_t begin = clock();
             framegen_assemble(xFrameGen, pubHeader, pubPayload, TS_PACKET_LEN * ulNumTSFramesPerPacket);
             clock_t end = clock();
+
+            if(g_iStop)
+                break;
 
             size_t ulSamplesLeft = framegen_get_symbol_count(xFrameGen);
 
@@ -481,6 +490,9 @@ int main(int argc, char *argv[])
             {
                 ulRead = fread(pfBuffer, sizeof(float complex), ulMTU, stdin);
             }
+
+            if(g_iStop)
+                break;
 
             clock_t begin = clock();
             framesync_process_samples(xFrameSync, pfBuffer, ulRead);
