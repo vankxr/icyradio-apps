@@ -117,18 +117,27 @@ static void framesync_process_seekpn(framesync_t *fs, float complex sym, unsigne
 
     if(best_i < 0)
     {
-        if(fs->symbol_counter >= 10 * fs->preamble_sym_len)
+        if(fs->symbol_counter >= 100 * fs->preamble_sym_len)
         {
             fs->symbol_counter = 0;
 
-            nco_crcf_reset(fs->mixer); // Prevent runaway NCO
+            // nco_crcf_reset(fs->mixer);
+            // eqlms_cccf_reset(fs->eq);
         }
 
         return;
     }
 
+    fs->cb_stats.rssi = agc_crcf_get_rssi(fs->agc);
+    fs->cb_stats.cfo = nco_crcf_get_frequency(fs->mixer) / (2.0f * M_PI);
+    fs->cb_stats.phi = M_PI / 2.0f * best_i;
+    fs->cb_stats.rxy = best_r;
+
+    if(fs->sync_cb)
+        fs->sync_cb(fs->cb_ptr, &fs->cb_stats);
+
     // Adjust mixer phase to de-rotate the remaining bits
-    nco_crcf_adjust_phase(fs->mixer, M_PI / 2.0f * best_i);
+    nco_crcf_adjust_phase(fs->mixer, fs->cb_stats.phi);
 
     // Reset counters and move on
     fs->symbol_counter = 0;
@@ -236,13 +245,13 @@ static void framesync_process_header(framesync_t *fs, float complex sym, unsigne
         }
         else
         {
-            if(fs->cb)
+            if(fs->pkt_rx_cb)
             {
                 fs->cb_stats.evm = fs->header_props.pilots ? qpilotsync_get_evm(fs->header_pilotsync) : 10.0f * log10f(fs->cb_stats.evm / (float)fs->symbol_counter);
-                fs->cb_stats.rssi = 20.0f * log10f(1.f / agc_crcf_get_gain(fs->agc));
-                fs->cb_stats.cfo = nco_crcf_get_frequency(fs->mixer);
+                fs->cb_stats.rssi = agc_crcf_get_rssi(fs->agc);
+                fs->cb_stats.cfo = nco_crcf_get_frequency(fs->mixer) / (2.0f * M_PI);
 
-                fs->cb(fs->cb_ptr, &fs->cb_stats, fs->header_dec + 6, fs->header_valid, NULL, 0, 0);
+                fs->pkt_rx_cb(fs->cb_ptr, &fs->cb_stats, fs->header_dec + 6, fs->header_valid, NULL, 0, 0);
             }
 
             // Reset counters and move on
@@ -327,13 +336,13 @@ static void framesync_process_payload(framesync_t *fs, float complex sym, unsign
 
         uint8_t force_relock = !fs->payload_valid;
 
-        if(fs->cb)
+        if(fs->pkt_rx_cb)
         {
             fs->cb_stats.evm = fs->payload_props.pilots ? qpilotsync_get_evm(fs->payload_pilotsync) : 10.0f * log10f(fs->cb_stats.evm / (float)fs->symbol_counter);
-            fs->cb_stats.rssi = 20.0f * log10f(1.f / agc_crcf_get_gain(fs->agc));
-            fs->cb_stats.cfo = nco_crcf_get_frequency(fs->mixer);
+            fs->cb_stats.rssi = agc_crcf_get_rssi(fs->agc);
+            fs->cb_stats.cfo = nco_crcf_get_frequency(fs->mixer) / (2.0f * M_PI);
 
-            force_relock |= !!fs->cb(fs->cb_ptr, &fs->cb_stats, fs->header_dec + 6, fs->header_valid, fs->payload_dec, fs->payload_dec_len, fs->payload_valid);
+            force_relock |= !!fs->pkt_rx_cb(fs->cb_ptr, &fs->cb_stats, fs->header_dec + 6, fs->header_valid, fs->payload_dec, fs->payload_dec_len, fs->payload_valid);
         }
 
         // Reset counters and move on
@@ -368,19 +377,24 @@ framesync_t *framesync_create(framegenprops_t *h_props, size_t h_len)
         return NULL;
 
     // callback
-    fs->cb = NULL;
+    fs->sig_det_cb = NULL;
+    fs->sig_lost_cb = NULL;
+    fs->sync_cb = NULL;
+    fs->pkt_rx_cb = NULL;
     fs->cb_ptr = NULL;
 
     // carrier, timing recovery and eq objects
-    float bw = 0.9f;
+    float bw = 0.5f;
 
     fs->agc = agc_crcf_create();
     agc_crcf_set_bandwidth(fs->agc, 0.02f * bw);
+    agc_crcf_squelch_enable(fs->agc);
+    agc_crcf_squelch_set_threshold(fs->agc, -30.0f);
 
     fs->mixer = nco_crcf_create(LIQUID_NCO);
     nco_crcf_pll_set_bandwidth(fs->mixer, 0.001f * bw);
 
-    fs->symsync = symsync_crcf_create_rnyquist(LIQUID_FIRFILT_RRC, 2, 15, 0.2f, 32);
+    fs->symsync = symsync_crcf_create_rnyquist(LIQUID_FIRFILT_RRC, 2, 15, 0.2f, 128);
     symsync_crcf_set_lf_bw(fs->symsync, 0.001f * bw);
     symsync_crcf_set_output_rate(fs->symsync, 2);
     fs->symsync_n = 0;
@@ -451,6 +465,12 @@ framesync_t *framesync_create(framegenprops_t *h_props, size_t h_len)
     fs->payload_soft = 0;
     fs->payload_valid = 0;
 
+#ifdef FRAMESYNC_DEBUG
+    fs->debug_fd = NULL;
+    fs->debug_counter = 0;
+    fs->debug_fr_counter = 0;
+#endif
+
     framesync_reset(fs);
 
     return fs;
@@ -459,6 +479,12 @@ void framesync_delete(framesync_t *fs)
 {
     if(!fs)
         return;
+
+    // debug
+#ifdef FRAMESYNC_DEBUG
+    if(fs->debug_fd)
+        fclose(fs->debug_fd);
+#endif
 
     // payload
     if(fs->payload_sym)
@@ -537,12 +563,15 @@ void framesync_reset(framesync_t *fs)
     fs->bit_counter = 0;
     fs->state = FRAMESYNC_STATE_PN_SEEK;
 }
-void framesync_set_callback(framesync_t *fs, framesync_packet_received_cb_t cb, void *cb_ptr)
+void framesync_set_callback(framesync_t *fs, framesync_signal_detected_cb_t sig_det_cb, framesync_signal_lost_cb_t sig_lost_cb, framesync_sync_cb_t sync_cb, framesync_packet_received_cb_t pkt_rx_cb, void *cb_ptr)
 {
     if(!fs)
         return;
 
-    fs->cb = cb;
+    fs->sig_det_cb = sig_det_cb;
+    fs->sig_lost_cb = sig_lost_cb;
+    fs->sync_cb = sync_cb;
+    fs->pkt_rx_cb = pkt_rx_cb;
     fs->cb_ptr = cb_ptr;
 }
 void framesync_get_header_props(framesync_t *fs, framegenprops_t *props)
@@ -616,6 +645,37 @@ void framesync_process_samples(framesync_t *fs, float complex *buffer, size_t bu
 
         agc_crcf_execute(fs->agc, buffer[i], &sym[0]);
 
+        int squelch = agc_crcf_squelch_get_status(fs->agc);
+
+        if(squelch == LIQUID_AGC_SQUELCH_RISE)
+        {
+            fs->cb_stats.rssi = agc_crcf_get_rssi(fs->agc);
+
+            if(fs->sig_det_cb)
+                fs->sig_det_cb(fs->cb_ptr, &fs->cb_stats);
+        }
+
+        if(squelch == LIQUID_AGC_SQUELCH_FALL)
+        {
+            nco_crcf_reset(fs->mixer);
+            symsync_crcf_reset(fs->symsync);
+            eqlms_cccf_reset(fs->eq);
+
+            fs->symsync_n = 0;
+            fs->symbol_counter = 0;
+            fs->byte_counter = 0;
+            fs->bit_counter = 0;
+            fs->state = FRAMESYNC_STATE_PN_SEEK;
+
+            fs->cb_stats.rssi = agc_crcf_get_rssi(fs->agc);
+
+            if(fs->sig_lost_cb)
+                fs->sig_lost_cb(fs->cb_ptr, &fs->cb_stats);
+        }
+
+        if(squelch < LIQUID_AGC_SQUELCH_RISE || squelch >= LIQUID_AGC_SQUELCH_TIMEOUT)
+            continue;
+
         symsync_crcf_execute(fs->symsync, sym, 1, sym, &n);
 
         for(size_t j = 0; j < n; j++)
@@ -650,40 +710,46 @@ void framesync_process_samples(framesync_t *fs, float complex *buffer, size_t bu
                 break;
             }
 
-            //demodulate and get phase error
+            // Semodulate and get phase error
             unsigned int demod_sym = 0;
             float phi_hat = 0.0f;
 
             if(dem)
             {
                 modemcf_demodulate(dem, _sym, &demod_sym);
+
                 phi_hat = modemcf_get_demodulator_phase_error(dem);
             }
 
             nco_crcf_pll_step(fs->mixer, phi_hat);
 
-            if(fs->eq_strat != FRAMESYNC_EQ_STRAT_OFF) // TODO Support Equalizer, after first PN alignment
+            if(fs->state != FRAMESYNC_STATE_PN_SEEK && fs->eq_strat != FRAMESYNC_EQ_STRAT_OFF)
             {
-                float complex _d = 0.0f;
-
                 switch(fs->eq_strat)
                 {
                     case FRAMESYNC_EQ_STRAT_CONST_MOD:
                     {
-                        _d = _sym / cabsf(_sym);
+                        eqlms_cccf_step(fs->eq, _sym / cabsf(_sym), _sym);
                     }
                     break;
                     case FRAMESYNC_EQ_STRAT_DEC_DIR:
                     {
                         if(dem)
+                        {
+                            float complex _d = 0.0f;
+
                             modemcf_get_demodulator_sample(dem, &_d);
+
+                            eqlms_cccf_step(fs->eq, _d, _sym);
+                        }
                     }
                     break;
                 }
-
-                eqlms_cccf_step(fs->eq, _d, _sym);
             }
 
+#ifdef FRAMESYNC_DEBUG
+            uint8_t _state = fs->state;
+#endif
             switch(fs->state)
             {
                 case FRAMESYNC_STATE_PN_SEEK:
@@ -699,6 +765,125 @@ void framesync_process_samples(framesync_t *fs, float complex *buffer, size_t bu
                     framesync_process_payload(fs, _sym, demod_sym);
                 break;
             }
+
+            // Handle state switching
+            switch(fs->state)
+            {
+                case FRAMESYNC_STATE_PN_SEEK:
+                case FRAMESYNC_STATE_PN_RX_DELAY:
+                    agc_crcf_unlock(fs->agc);
+                break;
+                case FRAMESYNC_STATE_HEADER:
+                case FRAMESYNC_STATE_PAYLOAD:
+                    agc_crcf_lock(fs->agc);
+                break;
+            }
+
+#ifdef FRAMESYNC_DEBUG
+            if(_state != FRAMESYNC_STATE_PN_SEEK && fs->debug_fd != NULL)
+                fprintf(fs->debug_fd, "%f + %fj,", crealf(_sym), cimagf(_sym));
+
+            if(fs->state != _state)
+            {
+                switch(_state)
+                {
+                    case FRAMESYNC_STATE_PN_RX_DELAY:
+                    {
+                        if(fs->debug_fd)
+                            fprintf(fs->debug_fd, "];\nheader_sym = [ ");
+                    }
+                    break;
+                    case FRAMESYNC_STATE_HEADER:
+                    {
+                        if(fs->debug_fd)
+                        {
+                            if(fs->state == FRAMESYNC_STATE_PAYLOAD)
+                            {
+                                fprintf(fs->debug_fd, "];\npayload_sym = [ ");
+                            }
+                            else
+                            {
+                                fprintf(fs->debug_fd, "];\n");
+
+                                fprintf(fs->debug_fd, "figure(\"Name\", \"Preamble\");\n");
+                                fprintf(fs->debug_fd, "plot(real(pn_sym), imag(pn_sym), \"x\");\n");
+                                fprintf(fs->debug_fd, "axis([-1.2 1.2 -1.2 1.2]);\n");
+                                fprintf(fs->debug_fd, "grid on;\n");
+                                fprintf(fs->debug_fd, "xlabel(\"I\");\n");
+                                fprintf(fs->debug_fd, "ylabel(\"Q\");\n");
+                                fprintf(fs->debug_fd, "figure(\"Name\", \"Header\");\n");
+                                fprintf(fs->debug_fd, "plot(real(header_sym), imag(header_sym), \"x\");\n");
+                                fprintf(fs->debug_fd, "axis([-1.2 1.2 -1.2 1.2]);\n");
+                                fprintf(fs->debug_fd, "grid on;\n");
+                                fprintf(fs->debug_fd, "xlabel(\"I\");\n");
+                                fprintf(fs->debug_fd, "ylabel(\"Q\");\n");
+
+                                fprintf(fs->debug_fd, "waitforbuttonpress;\n");
+
+                                fclose(fs->debug_fd);
+
+                                fs->debug_fd = NULL;
+                                fs->debug_counter++;
+                            }
+                        }
+                    }
+                    break;
+                    case FRAMESYNC_STATE_PAYLOAD:
+                    {
+                        if(fs->debug_fd)
+                        {
+                            fprintf(fs->debug_fd, "];\n");
+
+                            fprintf(fs->debug_fd, "figure(\"Name\", \"Preamble\");\n");
+                            fprintf(fs->debug_fd, "plot(real(pn_sym), imag(pn_sym), \"x\");\n");
+                            fprintf(fs->debug_fd, "axis([-1.2 1.2 -1.2 1.2]);\n");
+                            fprintf(fs->debug_fd, "grid on;\n");
+                            fprintf(fs->debug_fd, "xlabel(\"I\");\n");
+                            fprintf(fs->debug_fd, "ylabel(\"Q\");\n");
+                            fprintf(fs->debug_fd, "figure(\"Name\", \"Header\");\n");
+                            fprintf(fs->debug_fd, "plot(real(header_sym), imag(header_sym), \"x\");\n");
+                            fprintf(fs->debug_fd, "axis([-1.2 1.2 -1.2 1.2]);\n");
+                            fprintf(fs->debug_fd, "grid on;\n");
+                            fprintf(fs->debug_fd, "xlabel(\"I\");\n");
+                            fprintf(fs->debug_fd, "ylabel(\"Q\");\n");
+                            fprintf(fs->debug_fd, "figure(\"Name\", \"Payload\");\n");
+                            fprintf(fs->debug_fd, "plot(real(payload_sym), imag(payload_sym), \"x\");\n");
+                            fprintf(fs->debug_fd, "axis([-1.2 1.2 -1.2 1.2]);\n");
+                            fprintf(fs->debug_fd, "grid on;\n");
+                            fprintf(fs->debug_fd, "xlabel(\"I\");\n");
+                            fprintf(fs->debug_fd, "ylabel(\"Q\");\n");
+
+                            fprintf(fs->debug_fd, "waitforbuttonpress;\n");
+
+                            fclose(fs->debug_fd);
+
+                            fs->debug_fd = NULL;
+                            fs->debug_counter++;
+                        }
+
+                        if(!fs->debug_fr_counter)
+                        {
+                            fs->debug_fr_counter = FRAMESYNC_DEBUG;
+
+                            char filename[64];
+
+                            snprintf(filename, 64, "framesync_debug_%zu.m", fs->debug_counter);
+
+                            fs->debug_fd = fopen(filename, "w");
+
+                            fprintf(fs->debug_fd, "clear all;\n");
+                            fprintf(fs->debug_fd, "close all;\n");
+                            fprintf(fs->debug_fd, "pn_sym = [ ");
+                        }
+                        else
+                        {
+                            fs->debug_fr_counter--;
+                        }
+                    }
+                    break;
+                }
+            }
+#endif
         }
     }
 }

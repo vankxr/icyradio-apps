@@ -5,8 +5,13 @@
 #include <string.h>
 #include <math.h>
 #include <complex.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <liquid/liquid.h>
 #include "framegen.h"
+
+// Debug mode
+// #define FRAMESYNC_DEBUG 100 // Every 100 frames, write debug data to file
 
 // Synchronizer states
 #define FRAMESYNC_STATE_PN_SEEK     0   // preamble search and align
@@ -22,6 +27,9 @@
 typedef struct framesync_stats_t framesync_stats_t;
 typedef struct framesync_t framesync_t;
 
+typedef void (* framesync_signal_detected_cb_t)(void *, const framesync_stats_t *);
+typedef void (* framesync_signal_lost_cb_t)(void *, const framesync_stats_t *);
+typedef void (* framesync_sync_cb_t)(void *, const framesync_stats_t *);
 typedef uint8_t (* framesync_packet_received_cb_t)(void *, const framesync_stats_t *, const uint8_t *, const uint8_t, const uint8_t *, const size_t, const uint8_t);
 
 struct framesync_stats_t
@@ -29,11 +37,16 @@ struct framesync_stats_t
     float evm;      // error vector magnitude [dB]
     float rssi;     // received signal strength indicator [dB]
     float cfo;      // carrier frequency offset (f/Fs)
+    float phi;      // constellation rotation angle [radians]
+    float rxy;      // preamble correlation peak value
 };
 struct framesync_t
 {
     // callback
-    framesync_packet_received_cb_t cb;                 // user-defined callback function
+    framesync_signal_detected_cb_t sig_det_cb;         // user-defined callback function
+    framesync_signal_lost_cb_t     sig_lost_cb;        // user-defined callback function
+    framesync_sync_cb_t            sync_cb;            // user-defined callback function
+    framesync_packet_received_cb_t pkt_rx_cb;          // user-defined callback function
     void *                         cb_ptr;             // userdata pointer passed to callback
     framesync_stats_t              cb_stats;           // frame statistic object (synchronizer)
 
@@ -91,12 +104,19 @@ struct framesync_t
     size_t                         byte_counter;       // counter: num of bytes received
     size_t                         bit_counter;        // counter: num of bits received
     uint8_t                        state;              // receiver state
+
+    // debug
+#ifdef FRAMESYNC_DEBUG
+    FILE *                         debug_fd;           // debug file descriptor
+    size_t                         debug_counter;      // debug file counter
+    size_t                         debug_fr_counter;   // debug frame counter
+#endif
 };
 
 framesync_t *framesync_create(framegenprops_t *h_props, size_t h_len);
 void framesync_delete(framesync_t *fs);
 void framesync_reset(framesync_t *fs);
-void framesync_set_callback(framesync_t *fs, framesync_packet_received_cb_t cb, void *cb_ptr);
+void framesync_set_callback(framesync_t *fs, framesync_signal_detected_cb_t sig_det_cb, framesync_signal_lost_cb_t sig_lost_cb, framesync_sync_cb_t sync_cb, framesync_packet_received_cb_t pkt_rx_cb, void *cb_ptr);
 void framesync_get_header_props(framesync_t *fs, framegenprops_t *props);
 uint8_t framesync_get_header_soft_demod(framesync_t *fs);
 void framesync_set_header_soft_demod(framesync_t *fs, uint8_t soft);

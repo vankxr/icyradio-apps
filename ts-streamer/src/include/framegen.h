@@ -74,6 +74,7 @@ void framegen_get_header_props(framegen_t *fg, framegenprops_t *props);
 void framegen_get_payload_props(framegen_t *fg, framegenprops_t *props);
 void framegen_set_payload_props(framegen_t *fg, framegenprops_t *props);
 size_t framegen_get_symbol_count(framegen_t *fg);
+size_t framegen_get_sample_count(framegen_t *fg);
 void framegen_assemble(framegen_t *fg, uint8_t *header_user, uint8_t *payload, size_t payload_len);
 size_t framegen_write_samples(framegen_t *fg, float complex *buffer, size_t buffer_len);
 

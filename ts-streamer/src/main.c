@@ -15,10 +15,24 @@
 #define TS_PACKET_SYNC 0x47
 #define TS_PACKET_LEN 187 // 188 bytes per TS packet, sync byte extracted
 
+#define BW_FRACTION 0.75 // Fraction of the sample rate to use as bandwidth
+
 uint8_t g_ubDummyMode = 0;
 uint8_t g_ubQuietMode = 0;
 volatile sig_atomic_t g_iStop = 0;
 
+void signal_detected_cb(void *ptr, const framesync_stats_t *stats)
+{
+    DBGPRINTLN_CTX("Signal detected (RSSI: %.2f dB)", stats->rssi);
+}
+void signal_lost_cb(void *ptr, const framesync_stats_t *stats)
+{
+    DBGPRINTLN_CTX("Signal lost (RSSI: %.2f dB)", stats->rssi);
+}
+void sync_cb(void *ptr, const framesync_stats_t *stats)
+{
+    DBGPRINTLN_CTX("Preamble synchronized (RSSI: %.2f dB, CFO: %.2f %%Fs, Rot: %.0f deg, Corr: %.2f %%)", stats->rssi, stats->cfo * 100, stats->phi * 180 / M_PI, stats->rxy * 100);
+}
 uint8_t packet_received_cb(void *ptr, const framesync_stats_t *stats, const uint8_t *header, const uint8_t header_valid, const uint8_t *payload, const size_t payload_len, const uint8_t payload_valid)
 {
     if(!header_valid)
@@ -32,21 +46,21 @@ uint8_t packet_received_cb(void *ptr, const framesync_stats_t *stats, const uint
     static uint64_t ullTotalPackets = 0;
     static uint64_t ullTotalFailedPackets = 0;
     static uint64_t ullTotalLostPackets = 0;
-    static uint64_t ullLastPacket = 0;
-    uint64_t ullPacket = *(uint64_t *)header;
-    int64_t llLostPackets = ullPacket - ullLastPacket - 1;
-    uint8_t ubPrintStats = !payload_valid || !!llLostPackets;
+    static uint16_t usLastPacket = 0;
+    uint16_t usPacket = *(uint16_t *)header;
+    int32_t lLostPackets = (int32_t)usPacket - (int32_t)usLastPacket - 1;
+    uint8_t ubPrintStats = !payload_valid || lLostPackets > 0;
 
-    ullLastPacket = ullPacket;
+    usLastPacket = usPacket;
 
     ullTotalPackets++;
     ullTotalFailedPackets += !payload_valid;
 
-    if(llLostPackets > 0 && (uint64_t)llLostPackets < ullTotalPackets)
+    if(lLostPackets > 0 && (uint64_t)lLostPackets < ullTotalPackets)
     {
-        ullTotalLostPackets += llLostPackets;
+        ullTotalLostPackets += lLostPackets;
 
-        DBGPRINTLN_CTX("At least %ld packets lost", llLostPackets);
+        DBGPRINTLN_CTX("At least %d packets lost", lLostPackets);
     }
 
     if(ubPrintStats)
@@ -54,7 +68,7 @@ uint8_t packet_received_cb(void *ptr, const framesync_stats_t *stats, const uint
 
     if(!g_ubQuietMode)
     {
-        DBGPRINTLN_CTX("Packet %lu received (H %s, P: [%lu bytes, %s], RSSI: %.2f dB, EVM: %.2f dB, CFO %.2f %%Fs)", ullPacket, header_valid ? "OK" : "FAIL", payload_len, payload_valid ? "OK" : "FAIL", stats->rssi, stats->evm, stats->cfo * 100);
+        DBGPRINTLN_CTX("Packet %hu received (H %s, P: [%lu bytes, %s], RSSI: %.2f dB, EVM: %.2f dB, CFO: %.2f %%Fs)", usPacket, header_valid ? "OK" : "FAIL", payload_len, payload_valid ? "OK" : "FAIL", stats->rssi, stats->evm, stats->cfo * 100);
 
         // DBGPRINT_CTX("  Header: ");
         // for(int i = 0; i < 14; i++)
@@ -80,7 +94,7 @@ uint8_t packet_received_cb(void *ptr, const framesync_stats_t *stats, const uint
         }
     }
 
-    return stats->evm > -13;
+    return 0;
 }
 void signal_handler(int iSignal)
 {
@@ -105,86 +119,125 @@ int main(int argc, char *argv[])
     double fGain = 0.0;
     uint8_t ubAGC = 0;
     double fCarrierFreq = 433e6;
-    double fSampleRate = 2.4e6;
+    double fSampleRate = 2e6;
     size_t ulNumTSFramesPerPacket = 32;
+    char *pszAntenna = NULL;
+    size_t ulChannel = 0; // Inferred from antenna
+    char *pszSoapyDeviceArgs = NULL;
 
     int iOpt;
-    while((iOpt = getopt(argc, argv, "hdqztrg:af:s:n:")) != EOF)
+    while(optind < argc)
     {
-        switch(iOpt)
+        if((iOpt = getopt(argc, argv, "hdqztrg:af:s:n:w:")) != EOF)
         {
-            case 'h':
+            switch(iOpt)
             {
-                DBGPRINTLN("Usage: %s [-h] [-d] [-q] [-z] [-t] [-r] [-g <gain_dB>] [-a] [-f <freq>] [-s <rate>] [-n <num>]", argv[0]);
-                DBGPRINTLN("  -h: Print this help message");
-                DBGPRINTLN("  -d: Dummy mode (generate random TX data and discard RX data)");
-                DBGPRINTLN("  -q: Quiet mode (no verbose debug output)");
-                DBGPRINTLN("  -z: No radio mode (TX outputs samples to stdout and RX reads samples from stdin)");
-                DBGPRINTLN("  -t: TX mode");
-                DBGPRINTLN("  -r: RX mode (default)");
-                DBGPRINTLN("  -g <gain_dB>: RX gain (default: 0 dB) / TX attenuation (default: 10 dB)");
-                DBGPRINTLN("  -a: RX use AGC");
-                DBGPRINTLN("  -f <freq>: Carrier frequency (default: 433 MHz)");
-                DBGPRINTLN("  -s <rate>: Sample rate (default: 2.4 Msps)");
-                DBGPRINTLN("  -n <num>: Number of TS frames per packet (default: 32)");
+                case 'h':
+                {
+                    DBGPRINTLN("Usage: %s [-h] [-d] [-q] [-z] [-t] [-r] [-g <gain_dB>] [-a] [-f <freq>] [-s <rate>] [-n <num>] [-w <antenna>] [<enum_args>]", argv[0]);
+                    DBGPRINTLN("  -h: Print this help message");
+                    DBGPRINTLN("  -d: Dummy mode (generate random TX data and discard RX data)");
+                    DBGPRINTLN("  -q: Quiet mode (no verbose debug output)");
+                    DBGPRINTLN("  -z: No radio mode (TX outputs samples to stdout and RX reads samples from stdin)");
+                    DBGPRINTLN("  -t: TX mode");
+                    DBGPRINTLN("  -r: RX mode (default)");
+                    DBGPRINTLN("  -g <gain_dB>: RX gain (default: 0 dB) / TX attenuation (default: 10 dB)");
+                    DBGPRINTLN("  -a: RX use AGC");
+                    DBGPRINTLN("  -f <freq>: Carrier frequency (default: 433 MHz)");
+                    DBGPRINTLN("  -s <rate>: Sample rate (default: 2.4 Msps)");
+                    DBGPRINTLN("  -n <num>: Number of TS frames per packet (default: 32)");
+                    DBGPRINTLN("  -w <antenna>: Antenna (default: RX1A / TX1A)");
+                    DBGPRINTLN("  <enum_args>: SoapySDR device enumeration arguments");
 
-                return 0;
-            }
-            break;
-            case 'd':
-            {
-                g_ubDummyMode = 1;
-            }
-            break;
-            case 'q':
-            {
-                g_ubQuietMode = 1;
-            }
-            break;
-            case 'z':
-            {
-                ubNoRadio = 1;
-            }
-            break;
-            case 't':
-            {
-                ubTXnRX = 1;
-            }
-            break;
-            case 'r':
-            {
-                ubTXnRX = 0;
-            }
-            break;
-            case 'g':
-            {
-                fGain = atof(optarg);
-            }
-            break;
-            case 'a':
-            {
-                ubAGC = 1;
-            }
-            break;
-            case 'f':
-            {
-                fCarrierFreq = atof(optarg);
-            }
-            break;
-            case 's':
-            {
-                fSampleRate = atof(optarg);
-            }
-            break;
-            case 'n':
-            {
-                int n = atoi(optarg);
+                    return 0;
+                }
+                break;
+                case 'd':
+                {
+                    g_ubDummyMode = 1;
+                }
+                break;
+                case 'q':
+                {
+                    g_ubQuietMode = 1;
+                }
+                break;
+                case 'z':
+                {
+                    ubNoRadio = 1;
+                }
+                break;
+                case 't':
+                {
+                    ubTXnRX = 1;
 
-                ulNumTSFramesPerPacket = n <= 0 ? 32 : n;
+                    if(!pszAntenna)
+                    {
+                        pszAntenna = "TX1A";
+                        ulChannel = 0;
+                    }
+                }
+                break;
+                case 'r':
+                {
+                    ubTXnRX = 0;
+
+                    if(!pszAntenna)
+                    {
+                        pszAntenna = "RX1A";
+                        ulChannel = 0;
+                    }
+                }
+                break;
+                case 'g':
+                {
+                    fGain = atof(optarg);
+                }
+                break;
+                case 'a':
+                {
+                    ubAGC = 1;
+                }
+                break;
+                case 'f':
+                {
+                    fCarrierFreq = atof(optarg);
+                }
+                break;
+                case 's':
+                {
+                    fSampleRate = atof(optarg);
+                }
+                break;
+                case 'n':
+                {
+                    int n = atoi(optarg);
+
+                    ulNumTSFramesPerPacket = n <= 0 ? 32 : n;
+                }
+                break;
+                case 'w':
+                {
+                    pszAntenna = optarg;
+
+                    if(!strncmp(pszAntenna, "RX1", 3) || !strncmp(pszAntenna, "TX1", 3))
+                        ulChannel = 0;
+                    else if(!strncmp(pszAntenna, "RX2", 3) || !strncmp(pszAntenna, "TX2", 3))
+                        ulChannel = 1;
+                    else
+                        ulChannel = 0;
+                }
+                break;
+                default:
+                    exit(-1);
             }
-            break;
-            default:
-                exit(-1);
+        }
+        else
+        {
+            if(pszSoapyDeviceArgs)
+                DBGPRINTLN_CTX("Ignoring extra argument: %s", argv[optind++]);
+            else
+                pszSoapyDeviceArgs = argv[optind++];
         }
     }
 
@@ -196,6 +249,11 @@ int main(int argc, char *argv[])
     if(!ubNoRadio)
     {
         SoapySDRKwargs xArgs = {};
+
+        DBGPRINTLN_CTX("Searching for devices%s%s%s...", pszSoapyDeviceArgs ? " with args: \"" : "", pszSoapyDeviceArgs ? pszSoapyDeviceArgs : "", pszSoapyDeviceArgs ? "\"" : "");
+
+        if(pszSoapyDeviceArgs)
+            xArgs = SoapySDRKwargs_fromString(pszSoapyDeviceArgs);
 
         // SoapySDRKwargs_set(&xArgs, "driver", "icyradio");
         // SoapySDRKwargs_set(&args, "serial", "");
@@ -223,6 +281,15 @@ int main(int argc, char *argv[])
             DBGPRINTLN_CTX("Multiple devices found, using the first one...");
 
         pSDR = SoapySDRDevice_make(&pResults[0]);
+
+        if(!pSDR)
+        {
+            SoapySDRKwargsList_clear(pResults, ulDeviceCount);
+
+            DBGPRINTLN_CTX("Error making device!");
+
+            return -1;
+        }
     }
 
     if(!ubNoRadio)
@@ -233,14 +300,14 @@ int main(int argc, char *argv[])
         .crc = LIQUID_CRC_8,
         .i_fec = LIQUID_FEC_NONE,
         .o_fec = LIQUID_FEC_NONE,
-        .mod = LIQUID_MODEM_BPSK,
+        .mod = LIQUID_MODEM_QPSK,
         .pilots = 0,
     };
     framegenprops_t xFramePayloadProps = {
         .crc = LIQUID_CRC_8,
         .i_fec = LIQUID_FEC_CONV_V27P78,
         .o_fec = LIQUID_FEC_RS_M8_DVB,
-        .mod = LIQUID_MODEM_QAM16,
+        .mod = LIQUID_MODEM_QAM64,
         .pilots = 0,
     };
 
@@ -249,42 +316,55 @@ int main(int argc, char *argv[])
 
     if(ubTXnRX) // TX
     {
-        framegen_t *xFrameGen = framegen_create(&xFrameHeaderProps, 8);
+        framegen_t *xFrameGen = framegen_create(&xFrameHeaderProps, 2);
 
         framegen_set_payload_props(xFrameGen, &xFramePayloadProps);
 
         uint8_t *pubPayload = (uint8_t *)malloc(TS_PACKET_LEN * ulNumTSFramesPerPacket);
-        uint8_t pubHeader[8] = {0x00};
+        uint16_t usPacketNumber = 0;
 
         // Print stats
         {
-            const size_t ulInterpolation = 2; // FIXME: Get the number of samples per symbol dynamically
-
-            size_t ulHeaderLen = 8 + 6; // Packet number (8 bytes) + modulation (6 bytes)
+            // Header
+            size_t ulHeaderLen = 2 + 6; // Packet number (2 bytes) + modulation (6 bytes)
             size_t ulHeaderSymbols = ceilf((float)ulHeaderLen * 8 / modulation_types[xFrameHeaderProps.mod].bps);
             size_t ulCodedHeaderLen = fec_get_enc_msg_length(xFrameHeaderProps.i_fec, fec_get_enc_msg_length(xFrameHeaderProps.o_fec, ulHeaderLen + ((1 << (size_t)xFrameHeaderProps.crc) / 8)));
             size_t ulCodedHeaderSymbols = ceilf((float)ulCodedHeaderLen * 8 / modulation_types[xFrameHeaderProps.mod].bps);
             float fHeaderCodingEfficiency = (float)ulHeaderLen / ulCodedHeaderLen;
 
+            // Payload
             size_t ulPayloadLen = TS_PACKET_LEN * ulNumTSFramesPerPacket;
             size_t ulPayloadSymbols = ceilf((float)ulPayloadLen * 8 / modulation_types[xFramePayloadProps.mod].bps);
             size_t ulCodedPayloadLen = fec_get_enc_msg_length(xFramePayloadProps.i_fec, fec_get_enc_msg_length(xFramePayloadProps.o_fec, ulPayloadLen + ((1 << (size_t)xFramePayloadProps.crc) / 8)));
             size_t ulCodedPayloadSymbols = ceilf((float)ulCodedPayloadLen * 8 / modulation_types[xFramePayloadProps.mod].bps);
             float fPayloadCodingEfficiency = (float)ulPayloadLen / ulCodedPayloadLen;
-            float fTotalCodingEfficiency = (float)ulPayloadLen / (ulCodedHeaderLen + ulCodedPayloadLen); // Only the payload is considered useful data
+
+            // Ratio of useful data (payload) to total data (header + payload)
+            float fTotalCodingEfficiency = (float)ulPayloadLen / (ulCodedHeaderLen + ulCodedPayloadLen);
 
             // Assembly dummy packet to get the total number of symbols
             size_t ulPacketDataSymbols = ulCodedHeaderSymbols + ulCodedPayloadSymbols;
 
-            framegen_assemble(xFrameGen, pubHeader, pubPayload, TS_PACKET_LEN * ulNumTSFramesPerPacket);
+            framegen_assemble(xFrameGen, (uint8_t *)&usPacketNumber, pubPayload, TS_PACKET_LEN * ulNumTSFramesPerPacket);
 
-            size_t ulPacketSymbols = framegen_get_symbol_count(xFrameGen) / ulInterpolation;
+            size_t ulPacketSamples = framegen_get_sample_count(xFrameGen);
+            size_t ulPacketSymbols = framegen_get_symbol_count(xFrameGen);
 
             framegen_reset(xFrameGen);
 
+            size_t ulInterpolation = ulPacketSamples / ulPacketSymbols;
+            float fSymbolRate = fSampleRate / ulInterpolation;
+
+            // Ratio of coded data (header + payload) to total data (preamble + header + payload + etc...)
             float fFramerEfficiency = (float)ulPacketDataSymbols / ulPacketSymbols;
 
-            float fSymbolRate = fSampleRate / ulInterpolation;
+            // Ratio of useful data (uncoded payload) to total data (preamble + header + payload + etc...)
+            float fTotalEfficiency = fFramerEfficiency * fTotalCodingEfficiency;
+
+            // Time for one packet
+            float fPacketTime = (float)ulPacketSamples / fSampleRate;
+            float fPayloadRate = (float)ulPayloadLen * 8 / fPacketTime;
+            float fTSMuxRate = (float)(ulPayloadLen + ulNumTSFramesPerPacket) * 8 / fPacketTime; // Include the sync byte since we also receive it from the muxer
 
             DBGPRINTLN_CTX("Header data length: %lu bytes (%lu symbols)", ulHeaderLen, ulHeaderSymbols);
             DBGPRINTLN_CTX("Coded header length: %lu bytes (%lu symbols)", ulCodedHeaderLen, ulCodedHeaderSymbols);
@@ -298,20 +378,25 @@ int main(int argc, char *argv[])
             DBGPRINTLN_CTX("Packet data length: %lu symbols", ulPacketDataSymbols);
             DBGPRINTLN_CTX("Packet length: %lu symbols", ulPacketSymbols);
             DBGPRINTLN_CTX("Framer efficiency: %.2f %%", fFramerEfficiency * 100);
-            DBGPRINTLN_CTX("Total payload coding + framer efficiency: %.2f %%", fFramerEfficiency * fTotalCodingEfficiency * 100);
+            DBGPRINTLN_CTX("Total efficiency (payload only): %.2f %%", fTotalEfficiency * 100);
             DBGPRINTLN_CTX("--------------------");
             DBGPRINTLN_CTX("Sampling rate: %.2f Msps", fSampleRate / 1e6);
             DBGPRINTLN_CTX("Symbol rate: %.2f Msps", fSymbolRate / 1e6);
-            DBGPRINTLN_CTX("Payload bitrate: %.6f kbps", fSymbolRate * modulation_types[xFramePayloadProps.mod].bps * (float)ulPayloadSymbols / ulPacketSymbols / 1e3);
+            DBGPRINTLN_CTX("Packet time: %.6f ms", fPacketTime * 1e3);
+            DBGPRINTLN_CTX("Payload bitrate: %.6f kbps", fPayloadRate / 1e3);
+            DBGPRINTLN_CTX("Bandwidth efficiency: %.6f bits/s/Hz", fPayloadRate / (fSymbolRate * 1.2f));
+            DBGPRINTLN_CTX("TS Mux bitrate: %.0f bps", ceilf(fTSMuxRate));
         }
 
         if(pSDR)
         {
-            SoapySDRDevice_setSampleRate(pSDR, SOAPY_SDR_TX, 0, fSampleRate);
-            SoapySDRDevice_setBandwidth(pSDR, SOAPY_SDR_TX, 0, fSampleRate * 0.75);
-            SoapySDRDevice_setFrequency(pSDR, SOAPY_SDR_TX, 0, fCarrierFreq, NULL);
-            SoapySDRDevice_setAntenna(pSDR, SOAPY_SDR_TX, 0, "TX1A");
-            SoapySDRDevice_setGain(pSDR, SOAPY_SDR_TX, 0, fGain);
+            SoapySDRDevice_setSampleRate(pSDR, SOAPY_SDR_TX, ulChannel, fSampleRate);
+            SoapySDRDevice_setBandwidth(pSDR, SOAPY_SDR_TX, ulChannel, fSampleRate * BW_FRACTION);
+            SoapySDRDevice_setFrequency(pSDR, SOAPY_SDR_TX, ulChannel, fCarrierFreq, NULL);
+            SoapySDRDevice_setAntenna(pSDR, SOAPY_SDR_TX, ulChannel, pszAntenna);
+            SoapySDRDevice_setGain(pSDR, SOAPY_SDR_TX, ulChannel, fGain);
+
+            DBGPRINTLN_CTX("Transmitting on %.2f MHz at %.2f ksps with %.2f kHz of bandwidth and %.2f dB of gain via antenna %s...", fCarrierFreq / 1e6, fSampleRate / 1e3, fSampleRate * BW_FRACTION / 1e3, fGain, pszAntenna);
         }
 
         SoapySDRStream *pStream = NULL;
@@ -319,7 +404,7 @@ int main(int argc, char *argv[])
 
         if(pSDR)
         {
-            size_t ulChannels[] = {0};
+            size_t ulChannels[] = {ulChannel};
 
             pStream = SoapySDRDevice_setupStream(pSDR, SOAPY_SDR_TX, SOAPY_SDR_CF32, ulChannels, sizeof(ulChannels) / sizeof(ulChannels[0]), NULL);
             ulMTU = SoapySDRDevice_getStreamMTU(pSDR, pStream);
@@ -329,8 +414,6 @@ int main(int argc, char *argv[])
 
         while(!g_iStop)
         {
-            (*(uint64_t *)&pubHeader[0])++; // Packet number
-
             if(!g_ubDummyMode)
             {
                 for(size_t i = 0; i < ulNumTSFramesPerPacket; i++)
@@ -359,13 +442,15 @@ int main(int argc, char *argv[])
                 break;
 
             clock_t begin = clock();
-            framegen_assemble(xFrameGen, pubHeader, pubPayload, TS_PACKET_LEN * ulNumTSFramesPerPacket);
+            framegen_assemble(xFrameGen, (uint8_t *)&usPacketNumber, pubPayload, TS_PACKET_LEN * ulNumTSFramesPerPacket);
             clock_t end = clock();
+
+            usPacketNumber++;
 
             if(g_iStop)
                 break;
 
-            size_t ulSamplesLeft = framegen_get_symbol_count(xFrameGen);
+            size_t ulSamplesLeft = framegen_get_sample_count(xFrameGen);
 
             ullNumSamples += ulSamplesLeft;
             dTotalTime += (double)(end - begin) / CLOCKS_PER_SEC;
@@ -388,7 +473,7 @@ int main(int argc, char *argv[])
                         void *pSamples = (void *)&pfBuffer[ulOffset];
                         int iFlags = 0;
 
-                        // End burst only if no samples left and framegen_assemble was called with last parameter to true (last packet)
+                        // End burst only if no samples left
                         if(!ulSamplesLeft)
                             iFlags |= SOAPY_SDR_END_BURST;
 
@@ -428,20 +513,23 @@ int main(int argc, char *argv[])
     }
     else
     {
-        framesync_t *xFrameSync = framesync_create(&xFrameHeaderProps, 8);
+        framesync_t *xFrameSync = framesync_create(&xFrameHeaderProps, 2);
 
-        framesync_set_callback(xFrameSync, packet_received_cb, NULL);
+        framesync_set_callback(xFrameSync, signal_detected_cb, signal_lost_cb, sync_cb, packet_received_cb, NULL);
         framesync_set_header_soft_demod(xFrameSync, 0);
         framesync_set_payload_soft_demod(xFrameSync, 0);
+        framesync_set_eq_strategy(xFrameSync, FRAMESYNC_EQ_STRAT_DEC_DIR);
 
         if(pSDR)
         {
-            SoapySDRDevice_setSampleRate(pSDR, SOAPY_SDR_RX, 0, fSampleRate);
-            SoapySDRDevice_setBandwidth(pSDR, SOAPY_SDR_RX, 0, fSampleRate * 0.75);
-            SoapySDRDevice_setFrequency(pSDR, SOAPY_SDR_RX, 0, fCarrierFreq, NULL);
-            SoapySDRDevice_setAntenna(pSDR, SOAPY_SDR_RX, 0, "RX1A");
-            SoapySDRDevice_setGainMode(pSDR, SOAPY_SDR_RX, 0, ubAGC);
-            SoapySDRDevice_setGain(pSDR, SOAPY_SDR_RX, 0, fGain);
+            SoapySDRDevice_setSampleRate(pSDR, SOAPY_SDR_RX, ulChannel, fSampleRate);
+            SoapySDRDevice_setBandwidth(pSDR, SOAPY_SDR_RX, ulChannel, fSampleRate * BW_FRACTION);
+            SoapySDRDevice_setFrequency(pSDR, SOAPY_SDR_RX, ulChannel, fCarrierFreq, NULL);
+            SoapySDRDevice_setAntenna(pSDR, SOAPY_SDR_RX, ulChannel, pszAntenna);
+            SoapySDRDevice_setGainMode(pSDR, SOAPY_SDR_RX, ulChannel, ubAGC);
+            SoapySDRDevice_setGain(pSDR, SOAPY_SDR_RX, ulChannel, fGain);
+
+            DBGPRINTLN_CTX("Receiving on %.2f MHz at %.2f ksps with %.2f kHz of bandwidth and %.2f dB of gain via antenna %s...", fCarrierFreq / 1e6, fSampleRate / 1e3, fSampleRate * BW_FRACTION / 1e3, fGain, pszAntenna);
         }
 
         SoapySDRStream *pStream = NULL;
@@ -449,7 +537,7 @@ int main(int argc, char *argv[])
 
         if(pSDR)
         {
-            size_t ulChannels[] = {0};
+            size_t ulChannels[] = {ulChannel};
 
             pStream = SoapySDRDevice_setupStream(pSDR, SOAPY_SDR_RX, SOAPY_SDR_CF32, ulChannels, sizeof(ulChannels) / sizeof(ulChannels[0]), NULL);
             ulMTU = SoapySDRDevice_getStreamMTU(pSDR, pStream);

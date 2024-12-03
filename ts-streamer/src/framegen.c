@@ -92,7 +92,7 @@ static float complex framegen_generate_symbol(framegen_t *fg)
 }
 
 
-framegen_t * framegen_create(framegenprops_t *h_props, size_t h_len)
+framegen_t *framegen_create(framegenprops_t *h_props, size_t h_len)
 {
     if(!h_props)
         return NULL;
@@ -117,6 +117,7 @@ framegen_t * framegen_create(framegenprops_t *h_props, size_t h_len)
     // interpolator
     fg->interp_k = 2;
     fg->interp = firinterp_crcf_create_prototype(LIQUID_FIRFILT_RRC, fg->interp_k, 15, 0.2f, 0);
+    firinterp_crcf_set_scale(fg->interp, 0.72f);
     fg->interp_buf = (float complex *)malloc(fg->interp_k * sizeof(float complex));
 
     // preamble
@@ -269,7 +270,14 @@ size_t framegen_get_symbol_count(framegen_t *fg)
     if(!fg)
         return 0;
 
-    return fg->interp_k * (fg->preamble_pn_len + fg->header_sym_len + fg->payload_sym_len);
+    return fg->preamble_pn_len + fg->header_sym_len + fg->payload_sym_len;
+}
+size_t framegen_get_sample_count(framegen_t *fg)
+{
+    if(!fg)
+        return 0;
+
+    return fg->interp_k * framegen_get_symbol_count(fg);
 }
 void framegen_assemble(framegen_t *fg, uint8_t *header_user, uint8_t *payload, size_t payload_len)
 {
