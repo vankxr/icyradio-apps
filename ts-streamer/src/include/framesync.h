@@ -11,7 +11,7 @@
 #include "framegen.h"
 
 // Debug mode
-// #define FRAMESYNC_DEBUG 100 // Every 100 frames, write debug data to file
+#define FRAMESYNC_DEBUG 100 // Every 100 frames, write debug data to file
 
 // Synchronizer states
 #define FRAMESYNC_STATE_PN_SEEK     0   // preamble search and align

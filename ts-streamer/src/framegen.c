@@ -117,7 +117,7 @@ framegen_t *framegen_create(framegenprops_t *h_props, size_t h_len)
     // interpolator
     fg->interp_k = 2;
     fg->interp = firinterp_crcf_create_prototype(LIQUID_FIRFILT_RRC, fg->interp_k, 15, 0.2f, 0);
-    firinterp_crcf_set_scale(fg->interp, 0.72f);
+    firinterp_crcf_set_scale(fg->interp, 0.5f);
     fg->interp_buf = (float complex *)malloc(fg->interp_k * sizeof(float complex));
 
     // preamble

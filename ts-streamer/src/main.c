@@ -305,7 +305,7 @@ int main(int argc, char *argv[])
     };
     framegenprops_t xFramePayloadProps = {
         .crc = LIQUID_CRC_8,
-        .i_fec = LIQUID_FEC_CONV_V27P78,
+        .i_fec = LIQUID_FEC_CONV_V29P56,
         .o_fec = LIQUID_FEC_RS_M8_DVB,
         .mod = LIQUID_MODEM_QAM64,
         .pilots = 0,

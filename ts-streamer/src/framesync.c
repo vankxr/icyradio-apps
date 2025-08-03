@@ -780,87 +780,51 @@ void framesync_process_samples(framesync_t *fs, float complex *buffer, size_t bu
             }
 
 #ifdef FRAMESYNC_DEBUG
-            if(_state != FRAMESYNC_STATE_PN_SEEK && fs->debug_fd != NULL)
-                fprintf(fs->debug_fd, "%f + %fj,", crealf(_sym), cimagf(_sym));
-
             if(fs->state != _state)
             {
-                switch(_state)
+                if(fs->debug_fd && (fs->state == FRAMESYNC_STATE_PN_SEEK || fs->state == FRAMESYNC_STATE_PN_RX_DELAY))
+                {
+                    fprintf(fs->debug_fd, "];\n");
+
+                    fprintf(fs->debug_fd, "if exist(\"pn_sym\", \"var\")\n");
+                    fprintf(fs->debug_fd, "  figure(\"Name\", \"Preamble\");\n");
+                    fprintf(fs->debug_fd, "  plot(real(pn_sym), imag(pn_sym), \"x\");\n");
+                    fprintf(fs->debug_fd, "  axis([-1.2 1.2 -1.2 1.2]);\n");
+                    fprintf(fs->debug_fd, "  grid on;\n");
+                    fprintf(fs->debug_fd, "  xlabel(\"I\");\n");
+                    fprintf(fs->debug_fd, "  ylabel(\"Q\");\n");
+                    fprintf(fs->debug_fd, "end\n");
+                    fprintf(fs->debug_fd, "if exist(\"header_sym\", \"var\")\n");
+                    fprintf(fs->debug_fd, "  figure(\"Name\", \"Header\");\n");
+                    fprintf(fs->debug_fd, "  plot(real(header_sym), imag(header_sym), \"x\");\n");
+                    fprintf(fs->debug_fd, "  axis([-1.2 1.2 -1.2 1.2]);\n");
+                    fprintf(fs->debug_fd, "  grid on;\n");
+                    fprintf(fs->debug_fd, "  xlabel(\"I\");\n");
+                    fprintf(fs->debug_fd, "  ylabel(\"Q\");\n");
+                    fprintf(fs->debug_fd, "end\n");
+                    fprintf(fs->debug_fd, "if exist(\"payload_sym\", \"var\")\n");
+                    fprintf(fs->debug_fd, "  figure(\"Name\", \"Payload\");\n");
+                    fprintf(fs->debug_fd, "  plot(real(payload_sym), imag(payload_sym), \"x\");\n");
+                    fprintf(fs->debug_fd, "  axis([-1.2 1.2 -1.2 1.2]);\n");
+                    fprintf(fs->debug_fd, "  grid on;\n");
+                    fprintf(fs->debug_fd, "  xlabel(\"I\");\n");
+                    fprintf(fs->debug_fd, "  ylabel(\"Q\");\n");
+                    fprintf(fs->debug_fd, "end\n");
+
+                    fprintf(fs->debug_fd, "if exist(\"pn_sym\", \"var\") || exist(\"header_sym\", \"var\") || exist(\"payload_sym\", \"var\")\n");
+                    fprintf(fs->debug_fd, "  waitforbuttonpress;\n");
+                    fprintf(fs->debug_fd, "end\n");
+
+                    fclose(fs->debug_fd);
+
+                    fs->debug_fd = NULL;
+                    fs->debug_counter++;
+                }
+
+                switch(fs->state)
                 {
                     case FRAMESYNC_STATE_PN_RX_DELAY:
                     {
-                        if(fs->debug_fd)
-                            fprintf(fs->debug_fd, "];\nheader_sym = [ ");
-                    }
-                    break;
-                    case FRAMESYNC_STATE_HEADER:
-                    {
-                        if(fs->debug_fd)
-                        {
-                            if(fs->state == FRAMESYNC_STATE_PAYLOAD)
-                            {
-                                fprintf(fs->debug_fd, "];\npayload_sym = [ ");
-                            }
-                            else
-                            {
-                                fprintf(fs->debug_fd, "];\n");
-
-                                fprintf(fs->debug_fd, "figure(\"Name\", \"Preamble\");\n");
-                                fprintf(fs->debug_fd, "plot(real(pn_sym), imag(pn_sym), \"x\");\n");
-                                fprintf(fs->debug_fd, "axis([-1.2 1.2 -1.2 1.2]);\n");
-                                fprintf(fs->debug_fd, "grid on;\n");
-                                fprintf(fs->debug_fd, "xlabel(\"I\");\n");
-                                fprintf(fs->debug_fd, "ylabel(\"Q\");\n");
-                                fprintf(fs->debug_fd, "figure(\"Name\", \"Header\");\n");
-                                fprintf(fs->debug_fd, "plot(real(header_sym), imag(header_sym), \"x\");\n");
-                                fprintf(fs->debug_fd, "axis([-1.2 1.2 -1.2 1.2]);\n");
-                                fprintf(fs->debug_fd, "grid on;\n");
-                                fprintf(fs->debug_fd, "xlabel(\"I\");\n");
-                                fprintf(fs->debug_fd, "ylabel(\"Q\");\n");
-
-                                fprintf(fs->debug_fd, "waitforbuttonpress;\n");
-
-                                fclose(fs->debug_fd);
-
-                                fs->debug_fd = NULL;
-                                fs->debug_counter++;
-                            }
-                        }
-                    }
-                    break;
-                    case FRAMESYNC_STATE_PAYLOAD:
-                    {
-                        if(fs->debug_fd)
-                        {
-                            fprintf(fs->debug_fd, "];\n");
-
-                            fprintf(fs->debug_fd, "figure(\"Name\", \"Preamble\");\n");
-                            fprintf(fs->debug_fd, "plot(real(pn_sym), imag(pn_sym), \"x\");\n");
-                            fprintf(fs->debug_fd, "axis([-1.2 1.2 -1.2 1.2]);\n");
-                            fprintf(fs->debug_fd, "grid on;\n");
-                            fprintf(fs->debug_fd, "xlabel(\"I\");\n");
-                            fprintf(fs->debug_fd, "ylabel(\"Q\");\n");
-                            fprintf(fs->debug_fd, "figure(\"Name\", \"Header\");\n");
-                            fprintf(fs->debug_fd, "plot(real(header_sym), imag(header_sym), \"x\");\n");
-                            fprintf(fs->debug_fd, "axis([-1.2 1.2 -1.2 1.2]);\n");
-                            fprintf(fs->debug_fd, "grid on;\n");
-                            fprintf(fs->debug_fd, "xlabel(\"I\");\n");
-                            fprintf(fs->debug_fd, "ylabel(\"Q\");\n");
-                            fprintf(fs->debug_fd, "figure(\"Name\", \"Payload\");\n");
-                            fprintf(fs->debug_fd, "plot(real(payload_sym), imag(payload_sym), \"x\");\n");
-                            fprintf(fs->debug_fd, "axis([-1.2 1.2 -1.2 1.2]);\n");
-                            fprintf(fs->debug_fd, "grid on;\n");
-                            fprintf(fs->debug_fd, "xlabel(\"I\");\n");
-                            fprintf(fs->debug_fd, "ylabel(\"Q\");\n");
-
-                            fprintf(fs->debug_fd, "waitforbuttonpress;\n");
-
-                            fclose(fs->debug_fd);
-
-                            fs->debug_fd = NULL;
-                            fs->debug_counter++;
-                        }
-
                         if(!fs->debug_fr_counter)
                         {
                             fs->debug_fr_counter = FRAMESYNC_DEBUG;
@@ -873,7 +837,7 @@ void framesync_process_samples(framesync_t *fs, float complex *buffer, size_t bu
 
                             fprintf(fs->debug_fd, "clear all;\n");
                             fprintf(fs->debug_fd, "close all;\n");
-                            fprintf(fs->debug_fd, "pn_sym = [ ");
+                            fprintf(fs->debug_fd, "pn_sym = [");
                         }
                         else
                         {
@@ -881,8 +845,49 @@ void framesync_process_samples(framesync_t *fs, float complex *buffer, size_t bu
                         }
                     }
                     break;
+                    case FRAMESYNC_STATE_HEADER:
+                    {
+                        if(_state == FRAMESYNC_STATE_PN_RX_DELAY)
+                        {
+                            if(fs->debug_fd)
+                                fprintf(fs->debug_fd, "];\n");
+                        }
+                        else
+                        {
+                            if(!fs->debug_fr_counter)
+                            {
+                                fs->debug_fr_counter = FRAMESYNC_DEBUG;
+
+                                char filename[64];
+
+                                snprintf(filename, 64, "framesync_debug_%zu.m", fs->debug_counter);
+
+                                fs->debug_fd = fopen(filename, "w");
+
+                                fprintf(fs->debug_fd, "clear all;\n");
+                                fprintf(fs->debug_fd, "close all;\n");
+                            }
+                            else
+                            {
+                                fs->debug_fr_counter--;
+                            }
+                        }
+
+                        if(fs->debug_fd)
+                            fprintf(fs->debug_fd, "header_sym = [");
+                    }
+                    break;
+                    case FRAMESYNC_STATE_PAYLOAD:
+                    {
+                        if(fs->debug_fd)
+                            fprintf(fs->debug_fd, "];\npayload_sym = [");
+                    }
+                    break;
                 }
             }
+
+            if(fs->debug_fd)
+                fprintf(fs->debug_fd, "%f + %fj,", crealf(_sym), cimagf(_sym));
 #endif
         }
     }
